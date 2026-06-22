@@ -36,6 +36,14 @@ class N2MimicEnv(N2Env):
         for i in range(len(lower_body_names)):
             self.lower_body_indices[i] = self.gym.find_actor_rigid_body_handle(self.envs[0], self.actor_handles[0], lower_body_names[i])
 
+        # Clamp all body indices to valid range for ref_key_pos (MotionLoaderNingTracking has 20 bodies).
+        # URDF has 21 bodies, so indices >= 20 must be clamped to 19.
+        max_ref_idx = 19
+        self.upper_body_indices = torch.clamp(self.upper_body_indices, 0, max_ref_idx)
+        self.lower_body_indices = torch.clamp(self.lower_body_indices, 0, max_ref_idx)
+        self.feet_indices = torch.clamp(self.feet_indices, 0, max_ref_idx)
+        self.key_indices = torch.clamp(self.key_indices, 0, max_ref_idx)
+
     def _get_noise_scale_vec(self, cfg):
         if self.cfg.env.frame_stack is not None:
             noise_vec = torch.zeros(self.cfg.env.num_single_obs, device=self.device)
@@ -86,7 +94,8 @@ class N2MimicEnv(N2Env):
         # get key pos state
         self.update_key_pos_state()
         # for reward penalty curriculum
-        self.average_episode_length = 0. # num_compute_average_epl last termination episode length
+        self.average_episode_length = 0.  # num_compute_average_epl last termination episode length
+        self.current_mean_episode_length = 0.  # per-iteration mean, set by runner before curriculum update
         self.last_episode_length_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
         self.num_compute_average_epl = self.cfg.rewards.num_compute_average_epl
         # load motion components
@@ -183,6 +192,14 @@ class N2MimicEnv(N2Env):
         self.ref_key_pos = self.motion_loader_class.get_tar_toe_pos_local_batch(frames)
         self.ref_contact_mask = self.motion_loader_class.get_contact_mask_batch(frames)
 
+        # Pre-compute truncated key_pos (only first tar_toe_pos_local_num bodies)
+        # to avoid repeated shape mismatches in termination and rewards.
+        # ref_key_pos: (N, 60) = (N, 20*3), key_pos: (N, 21, 3) on GPU
+        root_pos = self.root_states[:, :3]
+        key_pos_full = (self.key_pos - root_pos.unsqueeze(1))
+        num_ref_bodies = self.ref_key_pos.shape[-1] // 3  # 20
+        self.key_pos_trunc = key_pos_full[:, :num_ref_bodies, :]
+
     def post_physics_step(self):
         """ 检查终止条件，计算观测值和奖励
             调用self._post_physics_step_callback()进行通用计算 
@@ -203,7 +220,6 @@ class N2MimicEnv(N2Env):
         self.base_ang_vel[:] = quat_rotate_inverse(self.base_quat, self.root_states[:, 10:13])
         self.projected_gravity[:] = quat_rotate_inverse(self.base_quat, self.gravity_vec)
         self.base_euler_xyz = get_euler_xyz_tensor(self.base_quat)
-        # 计算接触状态
         self.contacts = self.contact_forces[:, self.feet_indices, 2] > 5.
         self.contacts_filt = torch.logical_or(self.contacts, self.last_contacts).float()
 
@@ -252,15 +268,13 @@ class N2MimicEnv(N2Env):
             
         # 倒下终止条件
         if self.cfg.termination.terminate_by_fallen:
-            fallen_buf = (self.root_states[:, 2] - self.terrain_h) < self.cfg.termination.scales.termination_height
-            self.reset_buf |= fallen_buf
+            self.fallen_buf = (self.root_states[:, 2] - self.terrain_h) < self.cfg.termination.scales.termination_height
+            self.reset_buf |= self.fallen_buf
             
         # 运动距离过远终止条件
         if self.cfg.termination.terminate_when_motion_far:
-            root_pos = self.root_states[:, :3].clone() 
-            key_pos = (self.key_pos - root_pos.unsqueeze(1))
-            ref_key_pos = self.ref_key_pos.reshape(self.num_envs, -1, 3)
-            reset_buf_motion_far = torch.any(torch.norm(ref_key_pos - key_pos, dim=-1) > self.terminate_when_motion_far_threshold, dim=-1)
+            ref_bodies = self.ref_key_pos.reshape(self.num_envs, -1, 3)
+            reset_buf_motion_far = torch.any(torch.norm(ref_bodies - self.key_pos_trunc, dim=-1) > self.terminate_when_motion_far_threshold, dim=-1)
             self.reset_buf_terminate_by_motion_far = reset_buf_motion_far
             self.reset_buf |= reset_buf_motion_far
             
@@ -355,12 +369,19 @@ class N2MimicEnv(N2Env):
         """重采样运动时间"""
         if len(env_ids) == 0:
             return
-        # 测试模式下设置为0.0
+        warmup = getattr(self.cfg.rewards, 'motion_warmup_time_s', 0.5)
         if self.cfg.env.test:
-            self.motion_start_times[env_ids] = 0.0
+            # 测试模式：从 -warmup ~ 0.0 采样，负时间映射到"稳定站立帧"
+            self.motion_start_times[env_ids] = torch_rand_float(-warmup, 0.0, (len(env_ids), 1), device=self.device).squeeze(-1)
         else:
-            # 随机采样运动开始时间
-            self.motion_start_times[env_ids] = torch_rand_float(0.0, self.motion_lenth - self.dt,(len(env_ids), 1), device=self.device).squeeze(-1)
+            # 训练模式：~10% 的 env 从 -warmup ~ 0.0 采样（让策略学习"从站立过渡到动作起点"），
+            # 其余从动作内随机点采样。这样既能快速学完动作，又不会在 reset 瞬间抽搐。
+            n_warmup = max(1, int(0.1 * len(env_ids)))
+            warmup_ids = env_ids[:n_warmup]
+            self.motion_start_times[warmup_ids] = torch_rand_float(-warmup, 0.0, (n_warmup, 1), device=self.device).squeeze(-1)
+            rest_ids = env_ids[n_warmup:]
+            if len(rest_ids) > 0:
+                self.motion_start_times[rest_ids] = torch_rand_float(0.0, self.motion_lenth - self.dt, (len(rest_ids), 1), device=self.device).squeeze(-1)
     
     def _update_average_episode_length(self, env_ids):
         """更新平均episode长度"""
@@ -401,36 +422,132 @@ class N2MimicEnv(N2Env):
     
     def _update_reward_penalty_curriculum(self):
         """
-        根据平均episode长度更新惩罚课程。
+        根据当前 iteration 的平均 episode 长度更新惩罚课程。
 
-        如果平均episode长度低于惩罚级别下降阈值，
-        按一定级别程度减少惩罚缩放。
-        如果平均episode长度高于惩罚级别上升阈值，
-        按一定级别程度增加惩罚缩放。
-        在指定范围内裁剪惩罚缩放。
-
-        Returns:
-            None
+        current_mean_episode_length 由 runner 在每个 iteration 结束时设置，
+        反映当前策略的真实表现（而非 EMA 平滑后的历史均值）。
+        这样 curriculum 能在单个 episode 内快速响应策略变化。
         """
-        if self.average_episode_length < self.cfg.rewards.reward_penalty_level_down_threshold:
+        if self.current_mean_episode_length < self.cfg.rewards.reward_penalty_level_down_threshold:
             self.reward_penalty_scale *= (1 - self.cfg.rewards.reward_penalty_degree)
-        elif self.average_episode_length > self.cfg.rewards.reward_penalty_level_up_threshold:
+        elif self.current_mean_episode_length > self.cfg.rewards.reward_penalty_level_up_threshold:
             self.reward_penalty_scale *= (1 + self.cfg.rewards.reward_penalty_degree)
 
         self.reward_penalty_scale = np.clip(self.reward_penalty_scale, self.cfg.rewards.reward_min_penalty_scale, self.cfg.rewards.reward_max_penalty_scale)
     
     def _update_terminate_when_motion_far_curriculum(self):
-        """更新运动距离过远终止课程"""
+        """更新运动距离过远终止课程
+
+        使用 current_mean_episode_length（当前 iteration 均值）而非 EMA，
+        使 curriculum 能快速响应策略变化。
+        """
         assert self.cfg.termination.terminate_when_motion_far and self.cfg.termination.termination_curriculum.terminate_when_motion_far_curriculum
-        # 根据平均episode长度调整终止阈值
-        if self.average_episode_length < self.cfg.termination.termination_curriculum.terminate_when_motion_far_curriculum_level_down_threshold:
+        if self.current_mean_episode_length < self.cfg.termination.termination_curriculum.terminate_when_motion_far_curriculum_level_down_threshold:
             self.terminate_when_motion_far_threshold *= (1 + self.cfg.termination.termination_curriculum.terminate_when_motion_far_curriculum_degree)
-        elif self.average_episode_length > self.cfg.termination.termination_curriculum.terminate_when_motion_far_curriculum_level_up_threshold:
+        elif self.current_mean_episode_length > self.cfg.termination.termination_curriculum.terminate_when_motion_far_curriculum_level_up_threshold:
             self.terminate_when_motion_far_threshold *= (1 - self.cfg.termination.termination_curriculum.terminate_when_motion_far_curriculum_degree)
-        # 裁剪终止阈值
-        self.terminate_when_motion_far_threshold = np.clip(self.terminate_when_motion_far_threshold, 
-                                                         self.cfg.termination.termination_curriculum.terminate_when_motion_far_threshold_min, 
-                                                         self.cfg.termination.termination_curriculum.terminate_when_motion_far_threshold_max)
+        self.terminate_when_motion_far_threshold = np.clip(
+            self.terminate_when_motion_far_threshold,
+            self.cfg.termination.termination_curriculum.terminate_when_motion_far_threshold_min,
+            self.cfg.termination.termination_curriculum.terminate_when_motion_far_threshold_max)
+
+    def get_curriculum_state(self):
+        """
+        获取当前 curriculum 状态，用于保存到 checkpoint。
+        包含 reward_penalty_scale、terminate_when_motion_far_threshold、average_episode_length。
+        注意: average_episode_length 可能是 CUDA tensor，需转为 float。
+        """
+        avg_ep = self.average_episode_length
+        if hasattr(avg_ep, 'cpu'):
+            avg_ep = float(avg_ep.cpu())
+        return {
+            "reward_penalty_scale": float(self.reward_penalty_scale),
+            "terminate_when_motion_far_threshold": float(self.terminate_when_motion_far_threshold),
+            "average_episode_length": float(avg_ep),
+        }
+
+    def set_curriculum_state(self, state):
+        """
+        从 checkpoint 恢复 curriculum 状态。
+        确保 resume 后 penalty scale 和 threshold 与 checkpoint 保存时一致，
+        避免从头开始 curriculum 导致 policy 初期剧烈振荡。
+        """
+        self.reward_penalty_scale = float(state["reward_penalty_scale"])
+        self.terminate_when_motion_far_threshold = float(state["terminate_when_motion_far_threshold"])
+        self.average_episode_length = float(state["average_episode_length"])
+        print(f'  [n2_mimic_env] curriculum restored:')
+        print(f'    reward_penalty_scale={self.reward_penalty_scale:.6f}')
+        print(f'    terminate_when_motion_far_threshold={self.terminate_when_motion_far_threshold:.4f}')
+        print(f'    average_episode_length={self.average_episode_length:.2f}')
+
+    def reset_curriculum(self):
+        """
+        将 curriculum 重置为初始状态。
+        用于 resume 时放弃旧 curriculum，让新配置的 curriculum 参数从头开始生效。
+        新参数（degree、thresholds）从初始值开始，更能适应 policy 变化。
+        """
+        if self.use_reward_penalty_curriculum:
+            self.reward_penalty_scale = self.cfg.rewards.reward_initial_penalty_scale
+        if self.cfg.termination.terminate_when_motion_far and self.cfg.termination.termination_curriculum.terminate_when_motion_far_curriculum:
+            self.terminate_when_motion_far_threshold = self.cfg.termination.termination_curriculum.terminate_when_motion_far_initial_threshold
+        self.average_episode_length = float(self.cfg.rewards.num_compute_average_epl)
+        self.current_mean_episode_length = 0.
+        print(f'  [n2_mimic_env] curriculum RESET to initial values:')
+        print(f'    reward_penalty_scale={self.reward_penalty_scale:.6f}')
+        print(f'    terminate_when_motion_far_threshold={self.terminate_when_motion_far_threshold:.4f}')
+        print(f'    average_episode_length={self.average_episode_length:.2f}')
+
+    def get_rng_state(self):
+        """
+        获取所有 RNG 状态，用于保存到 checkpoint。
+        包含: torch CPU RNG、CUDA RNG（转为 CPU ByteTensor 以便序列化）。
+        """
+        import random
+        cuda_state = torch.cuda.get_rng_state_all()
+        # get_rng_state_all() 在多 GPU 时返回 list，单 GPU 时返回 ByteTensor
+        # 统一转为 CPU ByteTensor list 便于序列化
+        if isinstance(cuda_state, (list, tuple)):
+            cuda_state = [s.cpu().to(torch.uint8) for s in cuda_state]
+        else:
+            cuda_state = [cuda_state.cpu().to(torch.uint8)]
+        state = {
+            "torch_cpu": torch.get_rng_state(),
+            "torch_cuda": cuda_state,
+            "numpy": np.random.get_state(),
+            "random": random.getstate(),
+        }
+        return state
+
+    def set_rng_state(self, state):
+        """
+        从 checkpoint 恢复所有 RNG 状态。
+        确保 resume 后随机数序列与保存时一致，
+        避免因 domain randomization 差异导致初期性能崩溃。
+
+        注意: torch.load(map_location=device) 会把所有 tensor 移到目标 device，
+        包括 list 中的 CUDA tensor 和 CPU RNG state。因此需要强制移回 CPU。
+        """
+        import random
+        # CPU RNG：必须先移到 CPU 再使用
+        cpu_state = state["torch_cpu"]
+        if isinstance(cpu_state, torch.Tensor):
+            cpu_state = cpu_state.cpu()
+        if not isinstance(cpu_state, torch.ByteTensor):
+            cpu_state = torch.ByteTensor(cpu_state.numpy() if hasattr(cpu_state, 'numpy') else list(cpu_state))
+        torch.set_rng_state(cpu_state)
+        # CUDA RNG：torch.load(map_location) 可能把 list 中的 tensor 移到 CUDA，
+        # 需要先移回 CPU 再恢复到对应设备
+        cuda_state = state["torch_cuda"]
+        if isinstance(cuda_state, (list, tuple)):
+            for i, s in enumerate(cuda_state):
+                s_cpu = s.cpu()
+                torch.cuda.set_rng_state(s_cpu.to(dtype=torch.uint8), device=i)
+        else:
+            s_cpu = cuda_state.cpu()
+            torch.cuda.set_rng_state(s_cpu.to(dtype=torch.uint8))
+        np.random.set_state(state["numpy"])
+        random.setstate(state["random"])
+        print(f'  [n2_mimic_env] RNG state restored')
     
     def compute_observations(self):
         """ 计算观测值 """
@@ -541,7 +658,9 @@ class N2MimicEnv(N2Env):
 
         # 设置关节位置和速度
         self.dof_pos[env_ids] = self.motion_loader_class.get_joint_pose_batch(frames)
-        self.dof_vel[env_ids] = self.motion_loader_class.get_joint_vel_batch(frames)
+        # 强制 dof_vel=0：mocap frame 0 的关节速度非零会让机器人 reset 后产生冲击振荡。
+        # 策略需要 1-2 个 step 自行加速到 mocap 速度。
+        self.dof_vel[env_ids] = 0.0
         env_ids_int32 = env_ids.to(dtype=torch.int32)
         # 设置关节状态张量
         self.gym.set_dof_state_tensor_indexed(self.sim,
@@ -562,59 +681,57 @@ class N2MimicEnv(N2Env):
 
         # 基座位置
         root_pos = self.motion_loader_class.get_root_pos_batch(frames)
+        # 只保留水平位置（xy），强制 z 用默认站立高度（避免 motion 起点 z=0.64 落地震荡）
+        root_pos[:, 2] = self.cfg.init_state.pos[2]
         root_pos[:, :3] = root_pos[:, :3] + self.env_origins[env_ids, :3] + 0.02
         self.root_states[env_ids, :3] = root_pos
         # 基座姿态和速度
         root_orn = self.motion_loader_class.get_root_rot_batch(frames)
         self.root_states[env_ids, 3:7] = root_orn
-        self.root_states[env_ids, 7:10] = self.motion_loader_class.get_linear_vel_batch(frames)
-        self.root_states[env_ids, 10:13] = self.motion_loader_class.get_angular_vel_batch(frames)
+        # 强制 root 线速度=0、角速度=0，避免 mocap frame 0 的非零初速让机器人 reset 后跳
+        self.root_states[env_ids, 7:10] = 0.0
+        self.root_states[env_ids, 10:13] = 0.0
 
         # 设置根状态张量
         env_ids_int32 = env_ids.to(dtype=torch.int32)
         self.gym.set_actor_root_state_tensor_indexed(self.sim,
-                                                     gymtorch.unwrap_tensor(self.root_states),
-                                                     gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
+                                                    gymtorch.unwrap_tensor(self.root_states),
+                                                    gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
         
 # ================================================ Rewards ================================================== #
     def _reward_tracking_body_pos(self):
         """身体位置跟踪奖励"""
-        # 计算根位置和关键点位置
-        root_pos = self.root_states[:, :3].clone() 
-        key_pos = (self.key_pos - root_pos.unsqueeze(1))
         ref_key_pos = self.ref_key_pos.reshape(self.num_envs, -1, 3)
-        
-        # 计算上半身和下半身位置差异
-        upper_body_diff = ref_key_pos[:, self.upper_body_indices, :] - key_pos[:, self.upper_body_indices, :]
-        lower_body_diff = ref_key_pos[:, self.lower_body_indices, :] - key_pos[:, self.lower_body_indices, :]
+        num_ref = ref_key_pos.shape[1]
 
-        # 计算身体位置距离
+        upper = torch.clamp(self.upper_body_indices, 0, num_ref - 1)
+        lower = torch.clamp(self.lower_body_indices, 0, num_ref - 1)
+
+        upper_body_diff = ref_key_pos[:, upper, :] - self.key_pos_trunc[:, upper, :]
+        lower_body_diff = ref_key_pos[:, lower, :] - self.key_pos_trunc[:, lower, :]
+
         diff_body_pos_dist_upper = (upper_body_diff**2).mean(dim=-1).mean(dim=-1)
         diff_body_pos_dist_lower = (lower_body_diff**2).mean(dim=-1).mean(dim=-1)
 
-        # 指数衰减奖励
         r_body_pos_upper = torch.exp(-diff_body_pos_dist_upper / self.cfg.rewards.reward_tracking_sigma["tracking_upper_body_pos"])
         r_body_pos_lower = torch.exp(-diff_body_pos_dist_lower / self.cfg.rewards.reward_tracking_sigma["tracking_lower_body_pos"])
-        rew = r_body_pos_lower + r_body_pos_upper 
-    
-        # 更新自适应sigma
+        rew = r_body_pos_lower + r_body_pos_upper
+
         self._update_adaptive_sigma(diff_body_pos_dist_upper, 'tracking_upper_body_pos')
         self._update_adaptive_sigma(diff_body_pos_dist_lower, 'tracking_lower_body_pos')
         return rew
-    
+
     def _reward_tracking_feet_pos(self):
         """足部位置跟踪奖励"""
-        # 计算根位置和关键点位置
-        root_pos = self.root_states[:, :3].clone() 
-        key_pos = (self.key_pos - root_pos.unsqueeze(1))
         ref_key_pos = self.ref_key_pos.reshape(self.num_envs, -1, 3)
-        
-        # 计算足部位置差异
-        feet_diff = ref_key_pos[:, self.feet_indices, :] - key_pos[:, self.feet_indices, :]
+        num_ref = ref_key_pos.shape[1]
+
+        feet = torch.clamp(self.feet_indices, 0, num_ref - 1)
+
+        feet_diff = ref_key_pos[:, feet, :] - self.key_pos_trunc[:, feet, :]
         feet_dist = (feet_diff**2).mean(dim=-1).mean(dim=-1)
         rew = torch.exp(-feet_dist / self.cfg.rewards.reward_tracking_sigma["tracking_feet_pos"])
-        
-        # 更新自适应sigma
+
         self._update_adaptive_sigma(feet_dist, 'tracking_feet_pos')
         return rew
     
@@ -674,7 +791,74 @@ class N2MimicEnv(N2Env):
         # 更新自适应sigma
         self._update_adaptive_sigma(max_diff_joint_pos, 'tracking_max_joint_pos')
         return r_max_joint_pos
-    
+
+    # ---- Boxing3: 手臂关节跟踪（优先级最高）----
+    def _reward_tracking_arm_joint_pos(self):
+        """手臂关节位置跟踪奖励（仅手臂 DOFs：8 个关节）
+
+        拳击动作中手臂跟踪最关键：shoulder pitch/roll/yaw + elbow 决定出拳动作。
+        """
+        arm_idx = self.arm_dof_idxs
+        cur = self.dof_pos[:, arm_idx]
+        ref = self.ref_dof_pos[:, arm_idx]
+        diff = ((cur - ref) ** 2).mean(dim=-1)
+        rew = torch.exp(-diff / self.cfg.rewards.reward_tracking_sigma["tracking_arm_joint_pos"])
+        self._update_adaptive_sigma(diff, 'tracking_arm_joint_pos')
+        return rew
+
+    def _reward_tracking_arm_joint_vel(self):
+        """手臂关节速度跟踪奖励（仅手臂 DOFs）
+
+        保证出拳动作流畅、平滑。
+        """
+        arm_idx = self.arm_dof_idxs
+        cur = self.dof_vel[:, arm_idx]
+        ref = self.ref_dof_vel[:, arm_idx]
+        diff = ((cur - ref) ** 2).mean(dim=-1)
+        rew = torch.exp(-diff / self.cfg.rewards.reward_tracking_sigma["tracking_arm_joint_vel"])
+        self._update_adaptive_sigma(diff, 'tracking_arm_joint_vel')
+        return rew
+
+    def _reward_tracking_arm_max_joint_pos(self):
+        """手臂最大关节位置偏差奖励（仅手臂 DOFs）
+
+        惩罚最偏差最大的单个手臂关节。
+        """
+        arm_idx = self.arm_dof_idxs
+        cur = self.dof_pos[:, arm_idx]
+        ref = self.ref_dof_pos[:, arm_idx]
+        max_diff = ((cur - ref).abs()).max(dim=-1)[0]
+        rew = torch.exp(-max_diff / self.cfg.rewards.reward_tracking_sigma["tracking_arm_max_joint_pos"])
+        self._update_adaptive_sigma(max_diff, 'tracking_arm_max_joint_pos')
+        return rew
+
+    # ---- Boxing3: 腿部关节跟踪（平衡支撑）----
+    def _reward_tracking_leg_joint_pos(self):
+        """腿部关节位置跟踪奖励（仅腿部 DOFs：10 个关节）
+
+        拳击动作中腿部支撑决定稳定性：hip yaw/roll/pitch + knee + ankle。
+        """
+        leg_idx = self.leg_dof_idxs
+        cur = self.dof_pos[:, leg_idx]
+        ref = self.ref_dof_pos[:, leg_idx]
+        diff = ((cur - ref) ** 2).mean(dim=-1)
+        rew = torch.exp(-diff / self.cfg.rewards.reward_tracking_sigma["tracking_leg_joint_pos"])
+        self._update_adaptive_sigma(diff, 'tracking_leg_joint_pos')
+        return rew
+
+    def _reward_tracking_leg_joint_vel(self):
+        """腿部关节速度跟踪奖励（仅腿部 DOFs）
+
+        保证站立和移动时的平衡感。
+        """
+        leg_idx = self.leg_dof_idxs
+        cur = self.dof_vel[:, leg_idx]
+        ref = self.ref_dof_vel[:, leg_idx]
+        diff = ((cur - ref) ** 2).mean(dim=-1)
+        rew = torch.exp(-diff / self.cfg.rewards.reward_tracking_sigma["tracking_leg_joint_vel"])
+        self._update_adaptive_sigma(diff, 'tracking_leg_joint_vel')
+        return rew
+
     def _reward_tracking_contact_mask(self):
         """接触掩码跟踪奖励"""
         cur_contact_mask = self.contacts_filt
@@ -685,7 +869,7 @@ class N2MimicEnv(N2Env):
 
         rew = 1 - error_contact_mask.mean(dim=-1)
         return rew
-    
+
     def _reward_feet_air_time(self):
         """足部悬空时间奖励"""
         # 奖励长步幅

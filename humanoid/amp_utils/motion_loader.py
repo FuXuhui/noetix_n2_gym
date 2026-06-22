@@ -53,6 +53,7 @@ class MotionLoaderNing:
     ROT_SIZE = 4
     JOINT_POS_SIZE = 18
     TAR_TOE_POS_LOCAL_SIZE = 12
+    TAR_TOE_POS_LOCAL_NUM = 4   # number of toe keypoints (TAR_TOE_POS_LOCAL_SIZE / 3)
     LINEAR_VEL_SIZE = 3
     ANGULAR_VEL_SIZE = 3
     JOINT_VEL_SIZE = 18
@@ -89,16 +90,21 @@ class MotionLoaderNing:
             time_between_frames,
             reference_observation_horizon=2,
             num_preload_transitions=1000000,
-            motion_files=""
+            motion_files="",
+            default_pose_template=None,
             ):
         """Expert dataset provides AMP observations from Human mocap dataset.
 
         time_between_frames: Amount of time in seconds between transition.
+        default_pose_template: Optional (root_pos(3)+root_rot(4)+joint(18)+toe(12)
+            +lin_vel(3)+ang_vel(3)+joint_vel(18)+base_h(1)) = 64-dim numpy array.
+            Used as the warmup frame for t<0 instead of motion frame 0.
         """
         self.device = device
         self.time_between_frames = time_between_frames
         self.reference_observation_horizon = reference_observation_horizon
         self.num_preload_transitions = num_preload_transitions
+        self.default_pose_template = default_pose_template
         self.observation_start_dim = MotionLoaderNing.JOINT_POSE_START_IDX
         
         # Values to store for each trajectory.
@@ -217,13 +223,18 @@ class MotionLoaderNing:
         p = times / self.trajectory_lens[traj_idxs]
         n = self.trajectory_num_frames[traj_idxs]
         idx_low, idx_high = np.floor(p * n).astype(np.int32), np.ceil(p * n).astype(np.int32)
+        max_valid = self.trajectories[0].shape[0] - 1
+        idx_low = np.clip(idx_low, 0, max_valid)
+        idx_high = np.clip(idx_high, 0, max_valid)
         all_frame_starts = torch.zeros(len(traj_idxs), self.observation_dim, device=self.device)
         all_frame_ends = torch.zeros(len(traj_idxs), self.observation_dim, device=self.device)
         for traj_idx in set(traj_idxs):
             trajectory = self.trajectories[traj_idx]
             traj_mask = traj_idxs == traj_idx
-            all_frame_starts[traj_mask] = trajectory[idx_low[traj_mask]]
-            all_frame_ends[traj_mask] = trajectory[idx_high[traj_mask]]
+            il = torch.from_numpy(idx_low[traj_mask]).long().to(self.device)
+            ih = torch.from_numpy(idx_high[traj_mask]).long().to(self.device)
+            all_frame_starts[traj_mask] = trajectory[il]
+            all_frame_ends[traj_mask] = trajectory[ih]
         blend = torch.tensor(p * n - idx_low, device=self.device, dtype=torch.float32).unsqueeze(-1)
         return self.slerp(all_frame_starts, all_frame_ends, blend)
 
@@ -241,6 +252,9 @@ class MotionLoaderNing:
         p = times / self.trajectory_lens[traj_idxs]
         n = self.trajectory_num_frames[traj_idxs]
         idx_low, idx_high = np.floor(p * n).astype(np.int32), np.ceil(p * n).astype(np.int32)
+        max_valid = np.array([t.shape[0] - 1 for t in self.trajectories_full], dtype=np.int32)
+        idx_low = np.clip(idx_low, 0, max_valid[traj_idxs])
+        idx_high = np.clip(idx_high, 0, max_valid[traj_idxs])
         all_frame_pos_starts = torch.zeros(len(traj_idxs), MotionLoaderNing.POS_SIZE, device=self.device)
         all_frame_pos_ends = torch.zeros(len(traj_idxs), MotionLoaderNing.POS_SIZE, device=self.device)
         all_frame_rot_starts = torch.zeros(len(traj_idxs), MotionLoaderNing.ROT_SIZE, device=self.device)
@@ -250,12 +264,14 @@ class MotionLoaderNing:
         for traj_idx in set(traj_idxs):
             trajectory = self.trajectories_full[traj_idx]
             traj_mask = traj_idxs == traj_idx
-            all_frame_pos_starts[traj_mask] = MotionLoaderNing.get_root_pos_batch(trajectory[idx_low[traj_mask]])
-            all_frame_pos_ends[traj_mask] = MotionLoaderNing.get_root_pos_batch(trajectory[idx_high[traj_mask]])
-            all_frame_rot_starts[traj_mask] = MotionLoaderNing.get_root_rot_batch(trajectory[idx_low[traj_mask]])
-            all_frame_rot_ends[traj_mask] = MotionLoaderNing.get_root_rot_batch(trajectory[idx_high[traj_mask]])
-            all_frame_AMP_starts[traj_mask] = trajectory[idx_low[traj_mask]][:, MotionLoaderNing.JOINT_POSE_START_IDX:MotionLoaderNing.BASE_HEIGHT_END_IDX]
-            all_frame_AMP_ends[traj_mask] = trajectory[idx_high[traj_mask]][:, MotionLoaderNing.JOINT_POSE_START_IDX:MotionLoaderNing.BASE_HEIGHT_END_IDX]
+            il = torch.from_numpy(idx_low[traj_mask]).long().to(self.device)
+            ih = torch.from_numpy(idx_high[traj_mask]).long().to(self.device)
+            all_frame_pos_starts[traj_mask] = trajectory[il][:, :MotionLoaderNing.POS_SIZE]
+            all_frame_pos_ends[traj_mask] = trajectory[ih][:, :MotionLoaderNing.POS_SIZE]
+            all_frame_rot_starts[traj_mask] = trajectory[il][:, MotionLoaderNing.ROOT_ROT_START_IDX:MotionLoaderNing.ROOT_ROT_END_IDX]
+            all_frame_rot_ends[traj_mask] = trajectory[ih][:, MotionLoaderNing.ROOT_ROT_START_IDX:MotionLoaderNing.ROOT_ROT_END_IDX]
+            all_frame_AMP_starts[traj_mask] = trajectory[il][:, MotionLoaderNing.JOINT_POSE_START_IDX:MotionLoaderNing.BASE_HEIGHT_END_IDX]
+            all_frame_AMP_ends[traj_mask] = trajectory[ih][:, MotionLoaderNing.JOINT_POSE_START_IDX:MotionLoaderNing.BASE_HEIGHT_END_IDX]
         blend = torch.tensor(p * n - idx_low, device=self.device, dtype=torch.float32).unsqueeze(-1)
 
         pos_blend = self.slerp(all_frame_pos_starts, all_frame_pos_ends, blend)
@@ -386,6 +402,7 @@ class MotionLoaderNing10DOF:
     ROT_SIZE = 4
     JOINT_POS_SIZE = 10
     TAR_TOE_POS_LOCAL_SIZE = 6
+    TAR_TOE_POS_LOCAL_NUM = 2   # number of toe keypoints (TAR_TOE_POS_LOCAL_SIZE / 3)
     LINEAR_VEL_SIZE = 3
     ANGULAR_VEL_SIZE = 3
     JOINT_VEL_SIZE = 10
@@ -551,13 +568,18 @@ class MotionLoaderNing10DOF:
         p = times / self.trajectory_lens[traj_idxs]
         n = self.trajectory_num_frames[traj_idxs]
         idx_low, idx_high = np.floor(p * n).astype(np.int32), np.ceil(p * n).astype(np.int32)
+        max_valid = self.trajectories[0].shape[0] - 1
+        idx_low = np.clip(idx_low, 0, max_valid)
+        idx_high = np.clip(idx_high, 0, max_valid)
         all_frame_starts = torch.zeros(len(traj_idxs), self.observation_dim, device=self.device)
         all_frame_ends = torch.zeros(len(traj_idxs), self.observation_dim, device=self.device)
         for traj_idx in set(traj_idxs):
             trajectory = self.trajectories[traj_idx]
             traj_mask = traj_idxs == traj_idx
-            all_frame_starts[traj_mask] = trajectory[idx_low[traj_mask]]
-            all_frame_ends[traj_mask] = trajectory[idx_high[traj_mask]]
+            il = torch.from_numpy(idx_low[traj_mask]).long().to(self.device)
+            ih = torch.from_numpy(idx_high[traj_mask]).long().to(self.device)
+            all_frame_starts[traj_mask] = trajectory[il]
+            all_frame_ends[traj_mask] = trajectory[ih]
         blend = torch.tensor(p * n - idx_low, device=self.device, dtype=torch.float32).unsqueeze(-1)
         return self.slerp(all_frame_starts, all_frame_ends, blend)
 
@@ -575,6 +597,9 @@ class MotionLoaderNing10DOF:
         p = times / self.trajectory_lens[traj_idxs]
         n = self.trajectory_num_frames[traj_idxs]
         idx_low, idx_high = np.floor(p * n).astype(np.int32), np.ceil(p * n).astype(np.int32)
+        max_valid = np.array([t.shape[0] - 1 for t in self.trajectories_full], dtype=np.int32)
+        idx_low = np.clip(idx_low, 0, max_valid[traj_idxs])
+        idx_high = np.clip(idx_high, 0, max_valid[traj_idxs])
         all_frame_pos_starts = torch.zeros(len(traj_idxs), MotionLoaderNing10DOF.POS_SIZE, device=self.device)
         all_frame_pos_ends = torch.zeros(len(traj_idxs), MotionLoaderNing10DOF.POS_SIZE, device=self.device)
         all_frame_rot_starts = torch.zeros(len(traj_idxs), MotionLoaderNing10DOF.ROT_SIZE, device=self.device)
@@ -584,12 +609,14 @@ class MotionLoaderNing10DOF:
         for traj_idx in set(traj_idxs):
             trajectory = self.trajectories_full[traj_idx]
             traj_mask = traj_idxs == traj_idx
-            all_frame_pos_starts[traj_mask] = MotionLoaderNing10DOF.get_root_pos_batch(trajectory[idx_low[traj_mask]])
-            all_frame_pos_ends[traj_mask] = MotionLoaderNing10DOF.get_root_pos_batch(trajectory[idx_high[traj_mask]])
-            all_frame_rot_starts[traj_mask] = MotionLoaderNing10DOF.get_root_rot_batch(trajectory[idx_low[traj_mask]])
-            all_frame_rot_ends[traj_mask] = MotionLoaderNing10DOF.get_root_rot_batch(trajectory[idx_high[traj_mask]])
-            all_frame_amp_starts[traj_mask] = trajectory[idx_low[traj_mask]][:, MotionLoaderNing10DOF.JOINT_POSE_START_IDX:MotionLoaderNing10DOF.BASE_HEIGHT_END_IDX]
-            all_frame_amp_ends[traj_mask] = trajectory[idx_high[traj_mask]][:, MotionLoaderNing10DOF.JOINT_POSE_START_IDX:MotionLoaderNing10DOF.BASE_HEIGHT_END_IDX]
+            il = torch.from_numpy(idx_low[traj_mask]).long().to(self.device)
+            ih = torch.from_numpy(idx_high[traj_mask]).long().to(self.device)
+            all_frame_pos_starts[traj_mask] = trajectory[il][:, :MotionLoaderNing10DOF.POS_SIZE]
+            all_frame_pos_ends[traj_mask] = trajectory[ih][:, :MotionLoaderNing10DOF.POS_SIZE]
+            all_frame_rot_starts[traj_mask] = trajectory[il][:, MotionLoaderNing10DOF.ROOT_ROT_START_IDX:MotionLoaderNing10DOF.ROOT_ROT_END_IDX]
+            all_frame_rot_ends[traj_mask] = trajectory[ih][:, MotionLoaderNing10DOF.ROOT_ROT_START_IDX:MotionLoaderNing10DOF.ROOT_ROT_END_IDX]
+            all_frame_amp_starts[traj_mask] = trajectory[il][:, MotionLoaderNing10DOF.JOINT_POSE_START_IDX:MotionLoaderNing10DOF.BASE_HEIGHT_END_IDX]
+            all_frame_amp_ends[traj_mask] = trajectory[ih][:, MotionLoaderNing10DOF.JOINT_POSE_START_IDX:MotionLoaderNing10DOF.BASE_HEIGHT_END_IDX]
         blend = torch.tensor(p * n - idx_low, device=self.device, dtype=torch.float32).unsqueeze(-1)
 
         pos_blend = self.slerp(all_frame_pos_starts, all_frame_pos_ends, blend)
@@ -717,6 +744,7 @@ class MotionLoaderNing20DOF:
     ROT_SIZE = 4
     JOINT_POS_SIZE = 20
     TAR_TOE_POS_LOCAL_SIZE = 12
+    TAR_TOE_POS_LOCAL_NUM = 4   # number of toe keypoints (TAR_TOE_POS_LOCAL_SIZE / 3)
     LINEAR_VEL_SIZE = 3
     ANGULAR_VEL_SIZE = 3
     JOINT_VEL_SIZE = 20
@@ -883,13 +911,18 @@ class MotionLoaderNing20DOF:
         p = times / self.trajectory_lens[traj_idxs]
         n = self.trajectory_num_frames[traj_idxs]
         idx_low, idx_high = np.floor(p * n).astype(np.int32), np.ceil(p * n).astype(np.int32)
+        max_valid = self.trajectories[0].shape[0] - 1
+        idx_low = np.clip(idx_low, 0, max_valid)
+        idx_high = np.clip(idx_high, 0, max_valid)
         all_frame_starts = torch.zeros(len(traj_idxs), self.observation_dim, device=self.device)
         all_frame_ends = torch.zeros(len(traj_idxs), self.observation_dim, device=self.device)
         for traj_idx in set(traj_idxs):
             trajectory = self.trajectories[traj_idx]
             traj_mask = traj_idxs == traj_idx
-            all_frame_starts[traj_mask] = trajectory[idx_low[traj_mask]]
-            all_frame_ends[traj_mask] = trajectory[idx_high[traj_mask]]
+            il = torch.from_numpy(idx_low[traj_mask]).long().to(self.device)
+            ih = torch.from_numpy(idx_high[traj_mask]).long().to(self.device)
+            all_frame_starts[traj_mask] = trajectory[il]
+            all_frame_ends[traj_mask] = trajectory[ih]
         blend = torch.tensor(p * n - idx_low, device=self.device, dtype=torch.float32).unsqueeze(-1)
         return self.slerp(all_frame_starts, all_frame_ends, blend)
 
@@ -907,6 +940,9 @@ class MotionLoaderNing20DOF:
         p = times / self.trajectory_lens[traj_idxs]
         n = self.trajectory_num_frames[traj_idxs]
         idx_low, idx_high = np.floor(p * n).astype(np.int32), np.ceil(p * n).astype(np.int32)
+        max_valid = np.array([t.shape[0] - 1 for t in self.trajectories_full], dtype=np.int32)
+        idx_low = np.clip(idx_low, 0, max_valid[traj_idxs])
+        idx_high = np.clip(idx_high, 0, max_valid[traj_idxs])
         all_frame_pos_starts = torch.zeros(len(traj_idxs), MotionLoaderNing20DOF.POS_SIZE, device=self.device)
         all_frame_pos_ends = torch.zeros(len(traj_idxs), MotionLoaderNing20DOF.POS_SIZE, device=self.device)
         all_frame_rot_starts = torch.zeros(len(traj_idxs), MotionLoaderNing20DOF.ROT_SIZE, device=self.device)
@@ -916,12 +952,14 @@ class MotionLoaderNing20DOF:
         for traj_idx in set(traj_idxs):
             trajectory = self.trajectories_full[traj_idx]
             traj_mask = traj_idxs == traj_idx
-            all_frame_pos_starts[traj_mask] = MotionLoaderNing20DOF.get_root_pos_batch(trajectory[idx_low[traj_mask]])
-            all_frame_pos_ends[traj_mask] = MotionLoaderNing20DOF.get_root_pos_batch(trajectory[idx_high[traj_mask]])
-            all_frame_rot_starts[traj_mask] = MotionLoaderNing20DOF.get_root_rot_batch(trajectory[idx_low[traj_mask]])
-            all_frame_rot_ends[traj_mask] = MotionLoaderNing20DOF.get_root_rot_batch(trajectory[idx_high[traj_mask]])
-            all_frame_amp_starts[traj_mask] = trajectory[idx_low[traj_mask]][:, MotionLoaderNing20DOF.JOINT_POSE_START_IDX:MotionLoaderNing20DOF.BASE_HEIGHT_END_IDX]
-            all_frame_amp_ends[traj_mask] = trajectory[idx_high[traj_mask]][:, MotionLoaderNing20DOF.JOINT_POSE_START_IDX:MotionLoaderNing20DOF.BASE_HEIGHT_END_IDX]
+            il = torch.from_numpy(idx_low[traj_mask]).long().to(self.device)
+            ih = torch.from_numpy(idx_high[traj_mask]).long().to(self.device)
+            all_frame_pos_starts[traj_mask] = trajectory[il][:, :MotionLoaderNing20DOF.POS_SIZE]
+            all_frame_pos_ends[traj_mask] = trajectory[ih][:, :MotionLoaderNing20DOF.POS_SIZE]
+            all_frame_rot_starts[traj_mask] = trajectory[il][:, MotionLoaderNing20DOF.ROOT_ROT_START_IDX:MotionLoaderNing20DOF.ROOT_ROT_END_IDX]
+            all_frame_rot_ends[traj_mask] = trajectory[ih][:, MotionLoaderNing20DOF.ROOT_ROT_START_IDX:MotionLoaderNing20DOF.ROOT_ROT_END_IDX]
+            all_frame_amp_starts[traj_mask] = trajectory[il][:, MotionLoaderNing20DOF.JOINT_POSE_START_IDX:MotionLoaderNing20DOF.BASE_HEIGHT_END_IDX]
+            all_frame_amp_ends[traj_mask] = trajectory[ih][:, MotionLoaderNing20DOF.JOINT_POSE_START_IDX:MotionLoaderNing20DOF.BASE_HEIGHT_END_IDX]
         blend = torch.tensor(p * n - idx_low, device=self.device, dtype=torch.float32).unsqueeze(-1)
 
         pos_blend = self.slerp(all_frame_pos_starts, all_frame_pos_ends, blend)
@@ -1051,7 +1089,8 @@ class MotionLoaderNingTracking:
     POS_SIZE = 3
     ROT_SIZE = 4
     JOINT_POS_SIZE = 18
-    TAR_TOE_POS_LOCAL_SIZE = 63
+    TAR_TOE_POS_LOCAL_SIZE = 60   # 20 MuJoCo bodies × 3
+    TAR_TOE_POS_LOCAL_NUM = 20    # number of bodies in FK data
     LINEAR_VEL_SIZE = 3
     ANGULAR_VEL_SIZE = 3
     JOINT_VEL_SIZE = 18
@@ -1088,17 +1127,24 @@ class MotionLoaderNingTracking:
             time_between_frames,
             reference_observation_horizon=2,
             num_preload_transitions=1000000,
-            motion_files=""
+            motion_files="",
+            default_pose_template=None,
             ):
         """Expert dataset provides AMP observations from Human mocap dataset.
 
         time_between_frames: Amount of time in seconds between transition.
+        default_pose_template: Optional (root_pos(3)+root_rot(4)+joint(18)+toe(12)
+            +lin_vel(3)+ang_vel(3)+joint_vel(18)+base_h(1)) = 64-dim numpy array.
+            Used as the warmup frame for t<0 instead of motion frame 0.
         """
         self.device = device
         self.time_between_frames = time_between_frames
         self.reference_observation_horizon = reference_observation_horizon
         self.num_preload_transitions = num_preload_transitions
+        self.default_pose_template = default_pose_template
         self.observation_start_dim = MotionLoaderNingTracking.JOINT_POSE_START_IDX
+        self.tar_toe_pos_local_num = MotionLoaderNingTracking.TAR_TOE_POS_LOCAL_NUM
+        self.tar_toe_pos_local_size = MotionLoaderNingTracking.TAR_TOE_POS_LOCAL_SIZE
         
         # Values to store for each trajectory.
         self.trajectories = []
@@ -1216,13 +1262,18 @@ class MotionLoaderNingTracking:
         p = times / self.trajectory_lens[traj_idxs]
         n = self.trajectory_num_frames[traj_idxs]
         idx_low, idx_high = np.floor(p * n).astype(np.int32), np.ceil(p * n).astype(np.int32)
+        max_valid = self.trajectories[0].shape[0] - 1
+        idx_low = np.clip(idx_low, 0, max_valid)
+        idx_high = np.clip(idx_high, 0, max_valid)
         all_frame_starts = torch.zeros(len(traj_idxs), self.observation_dim, device=self.device)
         all_frame_ends = torch.zeros(len(traj_idxs), self.observation_dim, device=self.device)
         for traj_idx in set(traj_idxs):
             trajectory = self.trajectories[traj_idx]
             traj_mask = traj_idxs == traj_idx
-            all_frame_starts[traj_mask] = trajectory[idx_low[traj_mask]]
-            all_frame_ends[traj_mask] = trajectory[idx_high[traj_mask]]
+            il = torch.from_numpy(idx_low[traj_mask]).long().to(self.device)
+            ih = torch.from_numpy(idx_high[traj_mask]).long().to(self.device)
+            all_frame_starts[traj_mask] = trajectory[il]
+            all_frame_ends[traj_mask] = trajectory[ih]
         blend = torch.tensor(p * n - idx_low, device=self.device, dtype=torch.float32).unsqueeze(-1)
         return self.slerp(all_frame_starts, all_frame_ends, blend)
 
@@ -1240,22 +1291,58 @@ class MotionLoaderNingTracking:
         p = times / self.trajectory_lens[traj_idxs]
         n = self.trajectory_num_frames[traj_idxs]
         idx_low, idx_high = np.floor(p * n).astype(np.int32), np.ceil(p * n).astype(np.int32)
+        max_valid = np.array([t.shape[0] - 1 for t in self.trajectories_full], dtype=np.int32)
+        idx_low = np.clip(idx_low, 0, max_valid[traj_idxs])
+        idx_high = np.clip(idx_high, 0, max_valid[traj_idxs])
+
         all_frame_pos_starts = torch.zeros(len(traj_idxs), MotionLoaderNingTracking.POS_SIZE, device=self.device)
         all_frame_pos_ends = torch.zeros(len(traj_idxs), MotionLoaderNingTracking.POS_SIZE, device=self.device)
         all_frame_rot_starts = torch.zeros(len(traj_idxs), MotionLoaderNingTracking.ROT_SIZE, device=self.device)
         all_frame_rot_ends = torch.zeros(len(traj_idxs), MotionLoaderNingTracking.ROT_SIZE, device=self.device)
         all_frame_AMP_starts = torch.zeros(len(traj_idxs), MotionLoaderNingTracking.CONTACT_MASK_END_IDX - MotionLoaderNingTracking.JOINT_POSE_START_IDX, device=self.device)
-        all_frame_AMP_ends = torch.zeros(len(traj_idxs),  MotionLoaderNingTracking.CONTACT_MASK_END_IDX - MotionLoaderNingTracking.JOINT_POSE_START_IDX, device=self.device)
+        all_frame_AMP_ends = torch.zeros(len(traj_idxs), MotionLoaderNingTracking.CONTACT_MASK_END_IDX - MotionLoaderNingTracking.JOINT_POSE_START_IDX, device=self.device)
+
         for traj_idx in set(traj_idxs):
             trajectory = self.trajectories_full[traj_idx]
             traj_mask = traj_idxs == traj_idx
-            all_frame_pos_starts[traj_mask] = MotionLoaderNingTracking.get_root_pos_batch(trajectory[idx_low[traj_mask]])
-            all_frame_pos_ends[traj_mask] = MotionLoaderNingTracking.get_root_pos_batch(trajectory[idx_high[traj_mask]])
-            all_frame_rot_starts[traj_mask] = MotionLoaderNingTracking.get_root_rot_batch(trajectory[idx_low[traj_mask]])
-            all_frame_rot_ends[traj_mask] = MotionLoaderNingTracking.get_root_rot_batch(trajectory[idx_high[traj_mask]])
-            all_frame_AMP_starts[traj_mask] = trajectory[idx_low[traj_mask]][:, MotionLoaderNingTracking.JOINT_POSE_START_IDX:MotionLoaderNingTracking.CONTACT_MASK_END_IDX]
-            all_frame_AMP_ends[traj_mask] = trajectory[idx_high[traj_mask]][:, MotionLoaderNingTracking.JOINT_POSE_START_IDX:MotionLoaderNingTracking.CONTACT_MASK_END_IDX]
+            il = torch.from_numpy(idx_low[traj_mask]).long().to(self.device)
+            ih = torch.from_numpy(idx_high[traj_mask]).long().to(self.device)
+            all_frame_pos_starts[traj_mask] = trajectory[il][:, :MotionLoaderNingTracking.POS_SIZE]
+            all_frame_pos_ends[traj_mask] = trajectory[ih][:, :MotionLoaderNingTracking.POS_SIZE]
+            all_frame_rot_starts[traj_mask] = trajectory[il][:, MotionLoaderNingTracking.ROOT_ROT_START_IDX:MotionLoaderNingTracking.ROOT_ROT_END_IDX]
+            all_frame_rot_ends[traj_mask] = trajectory[ih][:, MotionLoaderNingTracking.ROOT_ROT_START_IDX:MotionLoaderNingTracking.ROOT_ROT_END_IDX]
+            all_frame_AMP_starts[traj_mask] = trajectory[il][:, MotionLoaderNingTracking.JOINT_POSE_START_IDX:MotionLoaderNingTracking.CONTACT_MASK_END_IDX]
+            all_frame_AMP_ends[traj_mask] = trajectory[ih][:, MotionLoaderNingTracking.JOINT_POSE_START_IDX:MotionLoaderNingTracking.CONTACT_MASK_END_IDX]
+
         blend = torch.tensor(p * n - idx_low, device=self.device, dtype=torch.float32).unsqueeze(-1)
+
+        # ---- Warmup: for negative times, use a stable "standing still" frame ----
+        # Default = the user-supplied default_pose_template (root_z=0.75, default_joint_angles,
+        # zero velocities, both feet on ground). Falls back to motion frame 0 if no template.
+        warmup_mask = times < 0
+        if warmup_mask.any():
+            if self.default_pose_template is not None:
+                warmup_frame = torch.tensor(
+                    self.default_pose_template, dtype=torch.float32, device=self.device
+                ).unsqueeze(0)
+            else:
+                warmup_frame = self.trajectories_full[0][0].clone().unsqueeze(0)
+                # Zero all velocities: linear_vel(3) + angular_vel(3) + joint_vel(18) = 24 elements
+                vel_start = MotionLoaderNingTracking.LINEAR_VEL_START_IDX
+                vel_end = MotionLoaderNingTracking.CONTACT_MASK_START_IDX
+                warmup_frame[:, vel_start:vel_end] = 0.0
+            # Force both feet on ground for standing pose
+            warmup_frame[:, MotionLoaderNingTracking.CONTACT_MASK_START_IDX:MotionLoaderNingTracking.CONTACT_MASK_END_IDX] = 1.0
+            warmup_pos = warmup_frame[:, :MotionLoaderNingTracking.POS_SIZE]
+            warmup_rot = warmup_frame[:, MotionLoaderNingTracking.ROOT_ROT_START_IDX:MotionLoaderNingTracking.ROOT_ROT_END_IDX]
+            warmup_amp = warmup_frame[:, MotionLoaderNingTracking.JOINT_POSE_START_IDX:MotionLoaderNingTracking.CONTACT_MASK_END_IDX]
+            all_frame_pos_starts[warmup_mask] = warmup_pos
+            all_frame_pos_ends[warmup_mask] = warmup_pos
+            all_frame_rot_starts[warmup_mask] = warmup_rot
+            all_frame_rot_ends[warmup_mask] = warmup_rot
+            all_frame_AMP_starts[warmup_mask] = warmup_amp
+            all_frame_AMP_ends[warmup_mask] = warmup_amp
+            blend[warmup_mask.squeeze()] = 0.0
 
         pos_blend = self.slerp(all_frame_pos_starts, all_frame_pos_ends, blend)
         rot_blend = quaternion_slerp(all_frame_rot_starts, all_frame_rot_ends, blend)

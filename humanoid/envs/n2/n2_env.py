@@ -33,6 +33,8 @@ class N2Env(LeggedRobot):
             self.up_right_yaw_roll  = [10, 11]  # 右上肢偏航和滚动关节索引
             self.ankle_dof_idxs = [8, 17]       # 脚踝关节索引
             self.up_joint_idxs = [0,1,2,3, 9,10,11,12]
+            self.arm_dof_idxs = [0,1,2,3, 9,10,11,12]
+            self.leg_dof_idxs = [4,5,6,7,8, 13,14,15,16,17]
         elif self.num_dofs == 20:
             # 20自由度配置：更完整的关节索引
             self.left_yaw_roll  = [4, 5]        # 左脚踝偏航和滚动关节索引

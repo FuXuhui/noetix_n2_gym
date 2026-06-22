@@ -1,0 +1,38 @@
+# N2 Walking3 motion imitation policy sim2sim config
+policy_path: "{LEGGED_GYM_ROOT_DIR}/sim2sim/policy/n2_walking3_conservative_ppo_88500/n2_walking3_conservative_ppo_88500.onnx"
+xml_path: "{LEGGED_GYM_ROOT_DIR}/resources/robots/N2/mjcf/n2_18dof.xml"
+
+# Total simulation time
+simulation_duration: 60.0
+# Simulation time step
+simulation_dt: 0.002
+# Controller update frequency (meets the requirement of simulation_dt * control_decimation=0.02; 50Hz)
+control_decimation: 10
+
+kps: [30, 30, 30, 30, 80, 80, 120, 120, 20, 30, 30, 30, 30, 80, 80, 120, 120, 20]
+kds: [1, 1, 1, 1, 5, 5, 5, 5, 2, 1, 1, 1, 1, 5, 5, 5, 5, 2]
+
+# Default joint angles — must match URDF joint order (same as n2_18dof.yaml)
+default_angles: [0.0, 0.2, 0.0, 0.0, 0.0, 0.0, -0.1495, 0.3215, -0.1720,
+                 0.0, -0.2, 0.0, 0.0, 0.0, 0.0, -0.1495, 0.3215, -0.1720]
+
+# Observation scales — match N2MimicCfg.obs_scales
+ang_vel_scale: 1.0
+dof_pos_scale: 1.0
+dof_vel_scale: 0.05
+action_scale: 0.25
+cmd_scale: [2.0, 2.0, 1.0]   # lin_vel_x, lin_vel_y, ang_vel_yaw
+
+# Motion policy dimensions (N2MimicCfg)
+num_actions: 18
+frame_stack: 5
+num_single_obs: 62
+num_obs: 310  # num_single_obs * frame_stack = 62 * 5
+
+# Initial velocity command
+cmd_init: [0.3, 0.0, 0.0]
+
+# Motion file info (for reference / debugging)
+motion_file: "/home/fff/noetix/noetix_n2_gym/datasets/mocap_motions/ning/walking/Walking_3.json"
+motion_frame_duration: 0.03337577815506509
+motion_num_frames: 588

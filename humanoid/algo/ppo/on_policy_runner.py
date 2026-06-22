@@ -241,6 +241,14 @@ class OnPolicyRunner:
                 collection_time = stop - start  # 收集时间
                 start = stop
 
+                # 将当前 iteration 的平均 episode 长度写入 env，供 curriculum 使用
+                if len(lenbuffer) > 0:
+                    current_mean_ep_len = statistics.mean(lenbuffer)
+                else:
+                    current_mean_ep_len = 0.0
+                if hasattr(self.env, 'current_mean_episode_length'):
+                    self.env.current_mean_episode_length = current_mean_ep_len
+
                 # 计算回报
                 if self.training_type == "rl":
                     self.alg.compute_returns(privileged_obs)
@@ -384,17 +392,33 @@ class OnPolicyRunner:
     def save(self, path: str, infos=None):
         """
         保存模型
-        
+
         Args:
             path: 保存路径
             infos: 附加信息
         """
+        # -- 保存 curriculum 状态
+        curriculum_state = None
+        if hasattr(self.env, 'get_curriculum_state'):
+            curriculum_state = self.env.get_curriculum_state()
+        # -- 保存当前 learning_rate (KL-based adaptive schedule)
+        current_lr = None
+        if hasattr(self.alg, 'learning_rate'):
+            current_lr = self.alg.learning_rate
+        # -- 保存 RNG 状态
+        rng_state = None
+        if hasattr(self.env, 'get_rng_state'):
+            rng_state = self.env.get_rng_state()
+
         # -- 保存模型
         saved_dict = {
             "model_state_dict": self.alg.policy.state_dict(),  # 模型状态字典
             "optimizer_state_dict": self.alg.optimizer.state_dict(),  # 优化器状态字典
             "iter": self.current_learning_iteration,  # 当前迭代次数
             "infos": infos,  # 附加信息
+            "curriculum_state": curriculum_state,  # curriculum 状态
+            "learning_rate": current_lr,  # 当前 learning_rate
+            "rng_state": rng_state,  # RNG 状态
         }
         # -- 如果使用了观测归一化，则保存归一化器
         if self.empirical_normalization:
@@ -410,7 +434,7 @@ class OnPolicyRunner:
 
     def load(self, path: str, load_optimizer: bool = True):
         """
-        加载模型
+        加载模型 — 自动检测维度不匹配并重建网络。
         
         Args:
             path: 模型路径
@@ -420,26 +444,82 @@ class OnPolicyRunner:
             加载的信息
         """
         loaded_dict = torch.load(path, weights_only=False, map_location=self.device)
+        
+        # -- 检测 policy 维度是否与 checkpoint 匹配
+        saved_actor_keys = [k for k in loaded_dict["model_state_dict"].keys() if 'actor' in k or ('mlp' in k and '0.weight' in k)]
+        if saved_actor_keys:
+            saved_first_key = saved_actor_keys[0]
+            saved_in = loaded_dict["model_state_dict"][saved_first_key].shape[1]
+            actor_obj = getattr(self.alg.policy.actor, 'mlp', self.alg.policy.actor)
+            current_in = actor_obj[0].weight.shape[1]
+            if saved_in != current_in:
+                print(f'[OnPolicyRunner.load] Dimension mismatch! '
+                      f'Checkpoint actor input={saved_in}, current={current_in}. '
+                      f'Rebuilding policy network...')
+                # Rebuild policy + storage with correct dims
+                policy_class = type(self.alg.policy)
+                self.alg.policy = policy_class(
+                    self.cfg['env']['num_observations'],
+                    self.cfg['env']['num_privileged_obs'],
+                    self.env.num_actions,
+                    **self.cfg['policy']
+                ).to(self.device)
+                self.alg.init_storage(
+                    self.training_type,
+                    self.env.num_envs,
+                    self.num_steps_per_env,
+                    [self.cfg['env']['num_observations']],
+                    [self.cfg['env']['num_privileged_obs']],
+                    [self.env.num_actions],
+                )
+                print(f'[OnPolicyRunner.load] Policy rebuilt with correct dims.')
+
         # -- 加载模型
         resumed_training = self.alg.policy.load_state_dict(loaded_dict["model_state_dict"])
+        _policy_loaded = len(loaded_dict["model_state_dict"]) > 0
         # -- 如果使用了观测归一化，则加载归一化器
+        # 只有 checkpoint 中实际保存了 normalizer state_dict 时才恢复
         if self.empirical_normalization:
-            if resumed_training:
-                # 如果恢复了之前的训练，则为actor/student加载归一化器
-                # 为critic/teacher加载归一化器
+            has_norm_state = "obs_norm_state_dict" in loaded_dict and loaded_dict["obs_norm_state_dict"] is not None
+            if _policy_loaded and has_norm_state:
                 self.obs_normalizer.load_state_dict(loaded_dict["obs_norm_state_dict"])
                 self.privileged_obs_normalizer.load_state_dict(loaded_dict["privileged_obs_norm_state_dict"])
             else:
-                # 如果没有恢复训练但加载了模型，这必须是跟随RL训练的蒸馏训练
-                # 因此为教师模型加载actor归一化器，不加载学生的归一化器
-                # 因为观测空间可能与之前的RL训练不同
                 self.privileged_obs_normalizer.load_state_dict(loaded_dict["obs_norm_state_dict"])
         # -- 如果使用了优化器则加载
-        if load_optimizer and resumed_training:
+        if load_optimizer and _policy_loaded:
             # -- 算法优化器
             self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+        # -- 恢复 curriculum 状态 (reward_penalty_scale, terminate_when_motion_far_threshold, average_episode_length)
+        if _policy_loaded and "curriculum_state" in loaded_dict and loaded_dict["curriculum_state"] is not None:
+            curriculum = loaded_dict["curriculum_state"]
+            if hasattr(self.env, 'set_curriculum_state'):
+                self.env.set_curriculum_state(curriculum)
+                print(f'[OnPolicyRunner.load] Restored curriculum state:')
+                for k, v in curriculum.items():
+                    print(f'  {k}: {v}')
+            else:
+                print(f'[OnPolicyRunner.load] Warning: env has no set_curriculum_state(), skipping curriculum restore')
+        # -- 恢复 learning_rate (KL-based adaptive schedule)
+        if _policy_loaded and "learning_rate" in loaded_dict and loaded_dict["learning_rate"] is not None:
+            saved_lr = loaded_dict["learning_rate"]
+            if hasattr(self.alg, 'learning_rate'):
+                old_lr = self.alg.learning_rate
+                self.alg.learning_rate = saved_lr
+                # Sync to optimizer param_groups
+                for param_group in self.alg.optimizer.param_groups:
+                    param_group["lr"] = saved_lr
+                print(f'[OnPolicyRunner.load] Restored learning_rate: {old_lr:.8f} -> {saved_lr:.8f}')
+        # -- 恢复 RNG 状态
+        if _policy_loaded and "rng_state" in loaded_dict and loaded_dict["rng_state"] is not None:
+            rng = loaded_dict["rng_state"]
+            if hasattr(self.env, 'set_rng_state'):
+                self.env.set_rng_state(rng)
+                print(f'[OnPolicyRunner.load] Restored RNG state')
+            else:
+                print(f'[OnPolicyRunner.load] Warning: env has no set_rng_state(), skipping RNG restore')
         # -- 加载当前学习迭代次数
-        if resumed_training:
+        if _policy_loaded:
             self.current_learning_iteration = loaded_dict["iter"]
         return loaded_dict["infos"]
 

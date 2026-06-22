@@ -39,6 +39,11 @@ class N2MimicCfg(LeggedRobotCfg):
             "R_leg_ankle_joint": -0.1720,
         }
 
+        # 手臂关节索引（用于拳击等需要手臂优先级跟踪的场景）
+        arm_dof_idxs = [0, 1, 2, 3, 9, 10, 11, 12]   # L/R shoulder_pitch/roll/yaw + elbow
+        # 腿部关节索引（用于平衡支撑）
+        leg_dof_idxs = [4, 5, 6, 7, 8, 13, 14, 15, 16, 17]  # L/R hip_yaw/roll/pitch + knee + ankle
+
     class env(LeggedRobotCfg.env):
         """环境配置"""
         # 并行环境数量
@@ -48,7 +53,7 @@ class N2MimicCfg(LeggedRobotCfg):
         # 单次观测维度
         num_single_obs = 62 
         # 特权观测维度
-        num_privileged_obs = 250 + 96
+        num_privileged_obs = 343
         # 观测空间总维度（帧堆叠后的结果）
         num_observations = int(frame_stack * num_single_obs)
         # 动作空间维度（18个自由度）
@@ -282,6 +287,13 @@ class N2MimicCfg(LeggedRobotCfg):
             "tracking_max_joint_pos": 1.0,
             "tracking_joint_pos": 0.3,
             "tracking_joint_vel": 30.0,
+            # Boxing3: arm joint tracking (arm DOFs separated for priority)
+            "tracking_arm_joint_pos": 0.8,
+            "tracking_arm_joint_vel": 30.0,
+            "tracking_arm_max_joint_pos": 2.0,
+            # Boxing3: leg joint tracking (balance support)
+            "tracking_leg_joint_pos": 0.5,
+            "tracking_leg_joint_vel": 20.0,
         }
         
         # 奖励惩罚课程学习配置
@@ -311,7 +323,7 @@ class N2MimicCfg(LeggedRobotCfg):
         ]
 
         # 计算平均EPL的数量
-        num_compute_average_epl = 10000
+        num_compute_average_epl = 500  # EMA 平滑（现主要由 current_mean_episode_length 驱动）
 
         class scales:
             """奖励缩放因子"""

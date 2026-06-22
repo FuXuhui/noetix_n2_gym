@@ -10,6 +10,7 @@ from humanoid import LEGGED_GYM_ROOT_DIR
 import torch
 from pynput.keyboard import Listener, Key
 import yaml
+import onnxruntime as ort
 
 import matplotlib.pyplot as plt
 
@@ -91,8 +92,18 @@ def run_mujoco(cfg):
     model.opt.timestep = simulation_dt
     data = mujoco.MjData(model)
 
-    # load policy
-    policy = torch.jit.load(policy_path)
+    # load policy — auto-detect ONNX vs TorchScript
+    policy_path_ext = policy_path.split('.')[-1].lower()
+    if policy_path_ext == 'onnx':
+        print(f"Loading ONNX policy: {policy_path}")
+        sess_options = ort.SessionOptions()
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        policy = ort.InferenceSession(policy_path, sess_options, providers=['CPUExecutionProvider'])
+        policy_is_onnx = True
+    else:
+        print(f"Loading TorchScript policy: {policy_path}")
+        policy = torch.jit.load(policy_path)
+        policy_is_onnx = False
 
     joint_names = [mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, i) for i in range(model.njnt)]
     print("joint_names:", joint_names)
@@ -139,9 +150,12 @@ def run_mujoco(cfg):
             model_input = np.zeros([1, num_obs], dtype=np.float32)
             for i in range(frame_stack):
                 model_input[0, i * num_single_obs : (i + 1) * num_single_obs] = hist_obs[i][0, :]
-            policy_input = torch.tensor(model_input)
-            
-            action[:] = policy(policy_input)[0].detach().numpy()
+            policy_input = torch.tensor(model_input) if not policy_is_onnx else model_input
+
+            if policy_is_onnx:
+                action[:] = policy.run(None, {'policy_input': policy_input})[0][0]
+            else:
+                action[:] = policy(policy_input)[0].detach().numpy()
 
             target_q = (action * action_scale) + defaut_dof_pos
         
@@ -202,6 +216,8 @@ if __name__ == '__main__':
         frame_stack = config["frame_stack"]
     
     command = cmd()
+    if "cmd_init" in config:
+        command.cmd = np.array(config["cmd_init"], dtype=np.float32)
     listener = Listener(on_press=command.cmd_swtich)
     listener.start()
     run_mujoco(config_file)
