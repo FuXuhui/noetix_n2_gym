@@ -1,6 +1,7 @@
 from humanoid.envs.n2.n2_env import N2Env
 
 import time
+import numpy as np
 from isaacgym.torch_utils import *
 from isaacgym import gymtorch
 import torch
@@ -98,6 +99,9 @@ class N2MimicEnv(N2Env):
         self.current_mean_episode_length = 0.  # per-iteration mean, set by runner before curriculum update
         self.last_episode_length_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
         self.num_compute_average_epl = self.cfg.rewards.num_compute_average_epl
+        # 过渡阶段状态缓冲区：0=站立稳定, 1=启动过渡, 2=正常motion跟踪
+        self.transition_phase_buf = torch.zeros(self.num_envs, dtype=torch.long, device=self.device, requires_grad=False)
+        self.transition_timer_buf = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device, requires_grad=False)
         # load motion components
         self.reference_motion_file = self.cfg.motion_loader.reference_motion_file
         self.reference_observation_horizon = self.cfg.motion_loader.reference_observation_horizon
@@ -112,6 +116,12 @@ class N2MimicEnv(N2Env):
         )
         self.motion_lenth = self.motion_loader.trajectory_lens[0]
         self.motion_start_times = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device, requires_grad=False)
+
+        # 合并 sigma_overrides 到 reward_tracking_sigma
+        if hasattr(self.cfg.rewards, 'sigma_overrides'):
+            for key, val in self.cfg.rewards.sigma_overrides.__dict__.items():
+                if not key.startswith('_') and key in self.cfg.rewards.reward_tracking_sigma:
+                    self.cfg.rewards.reward_tracking_sigma[key] = val
 
         self.compute_ref_state()
     
@@ -173,9 +183,8 @@ class N2MimicEnv(N2Env):
         return phase
     
     def compute_ref_state(self):
-        """计算参考状态"""
+        """计算参考状态。过渡阶段覆盖为站立/启动参考。"""
         phase = self._get_phase()
-        # 计算运动时间
         motion_times = (phase * self.motion_lenth).clamp(min=0.0, max=self.motion_lenth-self.dt).cpu().numpy()
         frames = self.motion_loader.get_full_frame_at_time_batch(np.array([0] * self.num_envs), motion_times)
 
@@ -192,13 +201,63 @@ class N2MimicEnv(N2Env):
         self.ref_key_pos = self.motion_loader_class.get_tar_toe_pos_local_batch(frames)
         self.ref_contact_mask = self.motion_loader_class.get_contact_mask_batch(frames)
 
+        # 过渡阶段覆盖参考状态
+        self._override_ref_for_transition()
+
         # Pre-compute truncated key_pos (only first tar_toe_pos_local_num bodies)
-        # to avoid repeated shape mismatches in termination and rewards.
         # ref_key_pos: (N, 60) = (N, 20*3), key_pos: (N, 21, 3) on GPU
         root_pos = self.root_states[:, :3]
         key_pos_full = (self.key_pos - root_pos.unsqueeze(1))
         num_ref_bodies = self.ref_key_pos.shape[-1] // 3  # 20
         self.key_pos_trunc = key_pos_full[:, :num_ref_bodies, :]
+
+    def _override_ref_for_transition(self):
+        """覆盖过渡阶段的参考状态：站立阶段用 URDF 默认，启动阶段平滑混合。"""
+        if not hasattr(self, 'transition_phase_buf'):
+            return
+
+        stand_mask = self.transition_phase_buf == 0
+        startup_mask = self.transition_phase_buf == 1
+        default_dof = self.default_dof_pos  # [1, num_dof], broadcast-compatible with [N, num_dof]
+
+        # 站立稳定阶段：关节位置用 default，速度=0，关键点位置用 motion frame 0 但速度=0
+        if stand_mask.any():
+            self.ref_dof_pos[stand_mask] = default_dof
+            self.ref_dof_vel[stand_mask] = 0.0
+            self.ref_lin_vel[stand_mask] = 0.0
+            self.ref_ang_vel[stand_mask] = 0.0
+
+        # 启动阶段：平滑混合 default → motion（参考随时间推进，不再锁定 frame_0）
+        # blend 控制 default → motion 的混合比，motion_ref_time 让参考随 startup 推进 motion
+        if startup_mask.any():
+            n_startup = startup_mask.sum().item()
+            if n_startup > 0:
+                startup_duration = getattr(self.cfg.reset, 'startup_duration_s', 2.75)
+                timer = self.transition_timer_buf[startup_mask]
+
+                # blend: 控制 default_dof 与 motion_dof 的混合比例
+                blend = (timer / startup_duration).clamp(0.0, 1.0)
+
+                # motion_ref_time: 随 startup 时间推进 motion 帧
+                # 到 startup 结束时，参考已推进 motion 的 startup_motion_time_equivalent_s 秒
+                motion_equiv = getattr(self.cfg.rewards, 'startup_motion_time_equivalent_s', 2.0)
+                elapsed_in_startup = timer.cpu().numpy()
+                motion_ref_times = np.clip(elapsed_in_startup + motion_equiv, 0, self.motion_lenth)
+                traj_idxs = np.array([0] * n_startup)
+
+                frames_motion = self.motion_loader.get_full_frame_at_time_batch(traj_idxs, motion_ref_times)
+                motion_dof = self.motion_loader_class.get_joint_pose_batch(frames_motion)
+                motion_vel = self.motion_loader_class.get_joint_vel_batch(frames_motion)
+                motion_key = self.motion_loader_class.get_tar_toe_pos_local_batch(frames_motion)
+                motion_contact = self.motion_loader_class.get_contact_mask_batch(frames_motion)
+
+                b = blend.unsqueeze(1)
+                self.ref_dof_pos[startup_mask] = default_dof * (1 - b) + motion_dof * b
+                self.ref_dof_vel[startup_mask] = motion_vel * b
+                self.ref_key_pos[startup_mask] = self.ref_key_pos[startup_mask] * (1 - b) + motion_key * b
+                self.ref_contact_mask[startup_mask] = motion_contact
+                self.ref_lin_vel[startup_mask] = 0.0
+                self.ref_ang_vel[startup_mask] = 0.0
 
     def post_physics_step(self):
         """ 检查终止条件，计算观测值和奖励
@@ -224,6 +283,9 @@ class N2MimicEnv(N2Env):
         self.contacts_filt = torch.logical_or(self.contacts, self.last_contacts).float()
 
         self._post_physics_step_callback()
+
+        # 更新过渡阶段状态
+        self._update_transition_phase()
 
         # 计算观测值、奖励、重置等
         self.check_termination()
@@ -312,6 +374,8 @@ class N2MimicEnv(N2Env):
         
         # 重采样运动时间
         self._resample_motion_times(env_ids)
+        # 初始化过渡阶段状态（必须在 _reset_* 之前，因为 reset 函数依赖 transition_phase_buf）
+        self._init_transition_state(env_ids)
         # 重置机器人状态
         self._reset_dofs_motion(env_ids, self.motion_start_times[env_ids])
         self._reset_root_states_motion(env_ids, self.motion_start_times[env_ids])
@@ -497,6 +561,34 @@ class N2MimicEnv(N2Env):
         print(f'    terminate_when_motion_far_threshold={self.terminate_when_motion_far_threshold:.4f}')
         print(f'    average_episode_length={self.average_episode_length:.2f}')
 
+    def _init_transition_state(self, env_ids):
+        """初始化过渡阶段状态：所有 env 从站立稳定阶段开始"""
+        self.transition_phase_buf[env_ids] = 0  # 0 = stand_stable
+        self.transition_timer_buf[env_ids] = 0.0
+
+    def _update_transition_phase(self):
+        """每步更新过渡阶段状态：0=站立稳定 → 1=启动过渡 → 2=正常motion跟踪"""
+        if not hasattr(self, 'transition_phase_buf'):
+            return
+        dt = self.dt  # dt = sim.dt (control loop 中的 actual physics dt)
+
+        stand_mask = (self.transition_phase_buf == 0)
+        if stand_mask.any():
+            stand_duration = getattr(self.cfg.reset, 'stand_stable_duration_s', 0.75)
+            self.transition_timer_buf[stand_mask] += dt
+            switch_to_startup = stand_mask & (self.transition_timer_buf >= stand_duration)
+            if switch_to_startup.any():
+                self.transition_phase_buf[switch_to_startup] = 1
+                self.transition_timer_buf[switch_to_startup] = 0.0
+
+        startup_mask = (self.transition_phase_buf == 1)
+        if startup_mask.any():
+            startup_duration = getattr(self.cfg.reset, 'startup_duration_s', 2.75)
+            self.transition_timer_buf[startup_mask] += dt
+            switch_to_motion = startup_mask & (self.transition_timer_buf >= startup_duration)
+            if switch_to_motion.any():
+                self.transition_phase_buf[switch_to_motion] = 2
+
     def get_rng_state(self):
         """
         获取所有 RNG 状态，用于保存到 checkpoint。
@@ -650,53 +742,141 @@ class N2MimicEnv(N2Env):
                                                                 self.cfg.rewards.reward_tracking_sigma[term])
     
     def _reset_dofs_motion(self, env_ids, motion_times):
-        """重置关节运动"""
-        # 获取轨迹索引和时间
-        traj_idxs = np.array([0] * motion_times.shape[0])
-        times = motion_times.clone().cpu().numpy()
-        frames = self.motion_loader.get_full_frame_at_time_batch(traj_idxs, times)
+        """重置关节运动。过渡阶段（phase 0/1）使用 URDF 默认姿态。"""
+        if len(env_ids) == 0:
+            return
 
-        # 设置关节位置和速度
-        self.dof_pos[env_ids] = self.motion_loader_class.get_joint_pose_batch(frames)
-        # 强制 dof_vel=0：mocap frame 0 的关节速度非零会让机器人 reset 后产生冲击振荡。
-        # 策略需要 1-2 个 step 自行加速到 mocap 速度。
-        self.dof_vel[env_ids] = 0.0
-        env_ids_int32 = env_ids.to(dtype=torch.int32)
-        # 设置关节状态张量
-        self.gym.set_dof_state_tensor_indexed(self.sim,
-                                              gymtorch.unwrap_tensor(self.dof_state),
-                                              gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
+        stand_envs = (self.transition_phase_buf[env_ids] == 0)
+        startup_envs = (self.transition_phase_buf[env_ids] == 1)
+        motion_envs = (self.transition_phase_buf[env_ids] == 2)
+
+        # 站立稳定阶段：使用 URDF 默认关节
+        if stand_envs.any():
+            s_ids = env_ids[stand_envs]
+            self.dof_pos[s_ids] = self.default_dof_pos
+            self.dof_vel[s_ids] = 0.0
+            s_int32 = s_ids.to(dtype=torch.int32)
+            self.gym.set_dof_state_tensor_indexed(self.sim,
+                                                  gymtorch.unwrap_tensor(self.dof_state),
+                                                  gymtorch.unwrap_tensor(s_int32), len(s_int32))
+
+        # 启动阶段：平滑混合 default → motion frame 0
+        if startup_envs.any():
+            u_ids = env_ids[startup_envs]
+            startup_duration = getattr(self.cfg.reset, 'startup_duration_s', 2.75)
+            blend = (self.transition_timer_buf[u_ids] / startup_duration).clamp(0.0, 1.0).unsqueeze(1)
+            # 获取 motion frame 0
+            n_startup = startup_envs.sum().item()
+            frames_0 = self.motion_loader.get_full_frame_at_time_batch(
+                np.array([0] * n_startup), np.zeros(n_startup))
+            motion_dof = self.motion_loader_class.get_joint_pose_batch(frames_0)
+            blended = self.default_dof_pos * (1 - blend) + motion_dof * blend
+            self.dof_pos[u_ids] = blended
+            self.dof_vel[u_ids] = 0.0
+            u_int32 = u_ids.to(dtype=torch.int32)
+            self.gym.set_dof_state_tensor_indexed(self.sim,
+                                                  gymtorch.unwrap_tensor(self.dof_state),
+                                                  gymtorch.unwrap_tensor(u_int32), len(u_int32))
+
+        # 正常 motion 阶段
+        if motion_envs.any():
+            m_ids = env_ids[motion_envs]
+            m_times = motion_times[motion_envs]
+            traj_idxs = np.array([0] * len(m_ids))
+            times = m_times.clone().cpu().numpy()
+            frames = self.motion_loader.get_full_frame_at_time_batch(traj_idxs, times)
+            self.dof_pos[m_ids] = self.motion_loader_class.get_joint_pose_batch(frames)
+            self.dof_vel[m_ids] = 0.0
+            m_int32 = m_ids.to(dtype=torch.int32)
+            self.gym.set_dof_state_tensor_indexed(self.sim,
+                                                  gymtorch.unwrap_tensor(self.dof_state),
+                                                  gymtorch.unwrap_tensor(m_int32), len(m_int32))
 
     def _reset_root_states_motion(self, env_ids, motion_times):
-        """ 重置选定环境的ROOT状态位置和速度
-            根据课程设置基座位置
-            选择-0.5:0.5范围内的随机基座速度[m/s, rad/s]
-        Args:
-            env_ids (List[int]): 环境ID
-        """
-        # 获取轨迹索引和时间
-        traj_idxs = np.array([0] * motion_times.shape[0])
-        times = motion_times.clone().cpu().numpy()
-        frames = self.motion_loader.get_full_frame_at_time_batch(traj_idxs, times)
+        """重置 ROOT 状态位置和速度。过渡阶段使用 URDF 默认站立状态。"""
+        if len(env_ids) == 0:
+            return
 
-        # 基座位置
-        root_pos = self.motion_loader_class.get_root_pos_batch(frames)
-        # 只保留水平位置（xy），强制 z 用默认站立高度（避免 motion 起点 z=0.64 落地震荡）
-        root_pos[:, 2] = self.cfg.init_state.pos[2]
-        root_pos[:, :3] = root_pos[:, :3] + self.env_origins[env_ids, :3] + 0.02
-        self.root_states[env_ids, :3] = root_pos
-        # 基座姿态和速度
-        root_orn = self.motion_loader_class.get_root_rot_batch(frames)
-        self.root_states[env_ids, 3:7] = root_orn
-        # 强制 root 线速度=0、角速度=0，避免 mocap frame 0 的非零初速让机器人 reset 后跳
-        self.root_states[env_ids, 7:10] = 0.0
-        self.root_states[env_ids, 10:13] = 0.0
+        stand_envs = (self.transition_phase_buf[env_ids] == 0)
+        startup_envs = (self.transition_phase_buf[env_ids] == 1)
+        motion_envs = (self.transition_phase_buf[env_ids] == 2)
+        default_z = self.cfg.init_state.pos[2]
+        env_origins_xy = self.env_origins[env_ids, :3] + 0.02
 
-        # 设置根状态张量
-        env_ids_int32 = env_ids.to(dtype=torch.int32)
-        self.gym.set_actor_root_state_tensor_indexed(self.sim,
-                                                    gymtorch.unwrap_tensor(self.root_states),
-                                                    gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
+        # 站立稳定阶段：使用 URDF 默认站立状态（默认高度、正面朝上）
+        if stand_envs.any():
+            s_ids = env_ids[stand_envs]
+            origins_xy = self.env_origins[s_ids, :3] + 0.02
+            self.root_states[s_ids, 0] = origins_xy[:, 0]
+            self.root_states[s_ids, 1] = origins_xy[:, 1]
+            self.root_states[s_ids, 2] = default_z
+            self.root_states[s_ids, 3:7] = torch.tensor([0., 0., 0., 1.], device=self.device)  # 默认朝向（正面朝上）
+            self.root_states[s_ids, 7:13] = 0.0
+            s_int32 = s_ids.to(dtype=torch.int32)
+            self.gym.set_actor_root_state_tensor_indexed(self.sim,
+                                                        gymtorch.unwrap_tensor(self.root_states),
+                                                        gymtorch.unwrap_tensor(s_int32), len(s_int32))
+
+        # 启动阶段：平滑混合 default → motion frame 0 的根状态
+        if startup_envs.any():
+            u_ids = env_ids[startup_envs]
+            startup_duration = getattr(self.cfg.reset, 'startup_duration_s', 2.75)
+            blend = (self.transition_timer_buf[u_ids] / startup_duration).clamp(0.0, 1.0).unsqueeze(1)
+            n_startup = startup_envs.sum().item()
+            frames_0 = self.motion_loader.get_full_frame_at_time_batch(
+                np.array([0] * n_startup), np.zeros(n_startup))
+            motion_root_pos = self.motion_loader_class.get_root_pos_batch(frames_0)
+            motion_root_orn = self.motion_loader_class.get_root_rot_batch(frames_0)
+            origins_xy = self.env_origins[u_ids, :3] + 0.02
+            # 混合位置：default (x=0,y=0) → motion frame 0
+            default_root = torch.zeros(n_startup, 3, device=self.device)
+            blended_root_pos = default_root * (1 - blend) + motion_root_pos * blend
+            blended_root_pos[:, 2] = default_z  # z 始终为默认高度
+            blended_root_pos[:, 0] += origins_xy[:, 0]
+            blended_root_pos[:, 1] += origins_xy[:, 1]
+            # 混合朝向
+            blended_root_orn = self._quat_slerp(
+                torch.tensor([0., 0., 0., 1.], device=self.device).expand(n_startup, -1),
+                motion_root_orn,
+                blend.squeeze(1)
+            )
+            self.root_states[u_ids, :3] = blended_root_pos
+            self.root_states[u_ids, 3:7] = blended_root_orn
+            self.root_states[u_ids, 7:13] = 0.0
+            u_int32 = u_ids.to(dtype=torch.int32)
+            self.gym.set_actor_root_state_tensor_indexed(self.sim,
+                                                        gymtorch.unwrap_tensor(self.root_states),
+                                                        gymtorch.unwrap_tensor(u_int32), len(u_int32))
+
+        # 正常 motion 阶段
+        if motion_envs.any():
+            m_ids = env_ids[motion_envs]
+            m_times = motion_times[motion_envs]
+            traj_idxs = np.array([0] * len(m_ids))
+            times = m_times.clone().cpu().numpy()
+            frames = self.motion_loader.get_full_frame_at_time_batch(traj_idxs, times)
+            root_pos = self.motion_loader_class.get_root_pos_batch(frames)
+            root_pos[:, 2] = default_z
+            root_pos[:, :3] = root_pos[:, :3] + self.env_origins[m_ids, :3] + 0.02
+            self.root_states[m_ids, :3] = root_pos
+            self.root_states[m_ids, 3:7] = self.motion_loader_class.get_root_rot_batch(frames)
+            self.root_states[m_ids, 7:13] = 0.0
+            m_int32 = m_ids.to(dtype=torch.int32)
+            self.gym.set_actor_root_state_tensor_indexed(self.sim,
+                                                        gymtorch.unwrap_tensor(self.root_states),
+                                                        gymtorch.unwrap_tensor(m_int32), len(m_int32))
+
+    def _quat_slerp(self, q1, q2, t):
+        """球面线性插值（SLERP）"""
+        dot = (q1 * q2).sum(dim=-1)
+        dot_clamped = dot.clamp(-1.0, 1.0)
+        omega = torch.acos(dot_clamped)
+        sin_omega = torch.sin(omega)
+        sin_omega[sin_omega < 1e-5] = 1.0
+        w1 = torch.sin((1 - t) * omega) / sin_omega
+        w2 = torch.sin(t * omega) / sin_omega
+        w1, w2 = w1.unsqueeze(-1), w2.unsqueeze(-1)
+        return w1 * q1 + w2 * q2
         
 # ================================================ Rewards ================================================== #
     def _reward_tracking_body_pos(self):
@@ -874,10 +1054,53 @@ class N2MimicEnv(N2Env):
         """足部悬空时间奖励"""
         # 奖励长步幅
         # 需要过滤接触，因为PhysX在网格上的接触报告不可靠
-        contact_filt = torch.logical_or(self.contacts, self.last_contacts) 
+        contact_filt = torch.logical_or(self.contacts, self.last_contacts)
         first_contact = (self.feet_air_time > 0.) * contact_filt
         self.feet_air_time += self.dt
         # 仅在首次接触地面时给予奖励
         rew_airTime = torch.sum((self.feet_air_time - 0.3) * first_contact, dim=1)
         self.feet_air_time *= ~contact_filt
         return rew_airTime
+
+    def _reward_motion_incentive(self):
+        """运动激励奖励：鼓励机器人主动运动，打破「原地站立」的局部最优。
+
+        在 stand/startup 阶段 ref_vel=0 时，tracking 奖励不起作用。
+        该奖励对非零关节速度给予正奖励，推动机器人主动跟随 motion。
+        """
+        # 使用手臂关节速度为主（拳击核心在手臂动作）
+        arm_vel = self.dof_vel[:, self.arm_dof_idxs]
+        arm_vel_mag = torch.norm(arm_vel, dim=1)
+        rew = torch.clamp(arm_vel_mag - 0.2, 0.0, 10.0) * 0.5
+        return rew
+
+    def _reward_base_tilt_asymmetric(self):
+        """非对称身体倾斜惩罚：允许少量前倾，严厉惩罚后倾。
+
+        projected_gravity[1] = pitch：
+          > 0 → 身体前倾（拳击出拳姿态，正常）
+          < 0 → 身体后倾（倒退回退，问题行为）
+        非对称设计：前倾容忍 0.3 rad，后倾容忍 0.05 rad。
+        """
+        pitch = self.projected_gravity[:, 1]
+
+        # 前倾惩罚（轻微）：pitch > 0.3 rad 时开始惩罚
+        fwd_pen = torch.clamp(pitch - 0.3, 0.0, 10.0)
+
+        # 后倾惩罚（严厉）：pitch < -0.05 rad 时开始惩罚，平方放大
+        bwd_pen = torch.clamp(-pitch - 0.05, 0.0, 10.0) ** 2
+
+        # 系数：前倾容忍度大，后倾几乎零容忍
+        rew = -0.5 * fwd_pen - 5.0 * bwd_pen
+        return rew
+
+    def _reward_yaw_stability(self):
+        """Yaw 轴稳定性惩罚：允许小幅扭腰，严格限制大幅转向。
+
+        只惩罚 yaw 角速度超过阈值（0.2 rad/s ≈ 11°/s）的情况。
+        拳击 motion 的 yaw 角速度几乎为 0，因此该奖励约束任意显著 yaw 旋转。
+        """
+        yaw_vel = self.base_ang_vel[:, 2]
+        ref_yaw_vel = self.ref_ang_vel[:, 2]
+        error = torch.clamp((yaw_vel - ref_yaw_vel).abs() - 0.2, 0.0, 10.0) ** 2
+        return -1.0 * error

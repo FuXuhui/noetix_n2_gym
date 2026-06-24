@@ -32,40 +32,63 @@ class N2Boxing3Cfg(N2MimicCfg):
             terminate_when_motion_far_curriculum_degree = 0.05   # 快速响应
 
     # ------------------------------------------------------------------ #
-    # rewards — 手臂关节优先级 + 平衡保护
+    # rewards — 手臂关节优先级 + 平衡保护 + 运动激励
     # ------------------------------------------------------------------ #
     class rewards(N2MimicCfg.rewards):
-        motion_warmup_time_s = 0.5   # test 模式：站立热身时间（秒），过渡到动作起点
+        motion_warmup_time_s = 0.5
+
+        # 过渡阶段配置
+        class transition:
+            transition_duration_s = 3.5
+            stand_stable_duration_s = 0.75
+            startup_duration_s = 2.75
+
+        # 重构：startup 阶段参考随时间推进 motion（不再锁定 frame_0）
+        # startup_motion_time_equivalent_s = 2.0 表示：
+        #   startup 开始时参考等价于 motion 第 2 秒，结束时等价于 motion 第 4 秒
+        #   这样 startup 期间机器人在学习真实运动，而不是站在原地
+        startup_motion_time_equivalent_s = 2.0
+
         reward_penalty_curriculum = True
         reward_initial_penalty_scale = 0.1
-        reward_penalty_level_down_threshold = 10   # 极短 ep 不调整
-        reward_penalty_level_up_threshold = 200   # 与 terminate_when_motion_far.level_up 对齐
+        reward_penalty_level_down_threshold = 10
+        reward_penalty_level_up_threshold = 200
         reward_penalty_degree = 0.01
 
         class scales(N2MimicCfg.rewards.scales):
-            # ---- 身体位置跟踪（整体感知，非按部位分开）----
-            tracking_body_pos = 2.5          # 提升：留原地比跟手更基本
-            tracking_body_vel = 1.5           # 提升：速度跟踪的梯度更陡
-            tracking_body_ang_vel = 1.2      # 提升：旋转稳定性
-            tracking_feet_pos = 2.0          # 脚部位置（平衡支撑面）
+            # ---- 身体位置跟踪 ----
+            tracking_body_pos = 2.0
+            tracking_body_vel = 1.5
+            tracking_body_ang_vel = 1.0
+            tracking_feet_pos = 2.0
 
-            # ---- 关节跟踪（arm/leg 分开主导，整体仅作 fallback）----
-            tracking_joint_pos = 0.2          # 大幅降低：与 arm/leg 重复，避免双重梯度
-            tracking_joint_vel = 0.2          # 同步降低
-            tracking_max_joint_pos = 0.5      # 同步降低
-            tracking_contact_mask = 0.5       # 接触掩码
+            # ---- 关节跟踪（arm/leg 分开，整体降低避免重复）----
+            tracking_joint_pos = 0.1
+            tracking_joint_vel = 0.1
+            tracking_max_joint_pos = 0.3
+            tracking_contact_mask = 0.5
 
-            # ---- 拳击专用：手臂关节高精度跟踪（核心）----
-            tracking_arm_joint_pos = 4.0     # 提升：手臂关节位置（最重要）
-            tracking_arm_joint_vel = 2.5     # 提升：手臂关节速度
-            tracking_arm_max_joint_pos = 2.5 # 提升：手臂最大关节偏差
+            # ---- 拳击专用：手臂关节高精度跟踪（权重大幅提升）----
+            # shoulder_pitch/roll/yaw + elbow：拳击动作的核心
+            tracking_arm_joint_pos = 8.0     # 大幅提升：肩肘关节是出拳关键
+            tracking_arm_joint_vel = 5.0     # 大幅提升：出拳速度平滑性
+            tracking_arm_max_joint_pos = 5.0  # 大幅提升：最大关节偏差惩罚
 
-            # ---- 拳击专用：腿部关节跟踪（平衡用，降低权重）----
-            tracking_leg_joint_pos = 0.8    # 降低：腿部跟踪让位给平衡
-            tracking_leg_joint_vel = 0.5    # 降低
+            # ---- 拳击专用：腿部关节跟踪（平衡支撑）----
+            tracking_leg_joint_pos = 0.8
+            tracking_leg_joint_vel = 0.5
 
-            # ---- 步态/平衡奖励 ----
-            feet_air_time = 0.5              # 保持支撑
+            # ---- 步态/平衡 ----
+            feet_air_time = 0.5
+
+            # ---- 运动激励：打破「原地站立」局部最优 ----
+            motion_incentive = 1.0            # 鼓励主动运动（非零关节速度）
+
+            # ---- 身体倾斜：允许前倾，严惩后倾 ----
+            base_tilt_asymmetric = 1.0        # 非对称倾斜惩罚（函数内已有惩罚系数）
+
+            # ---- Yaw 轴稳定性：允许小幅扭腰，严限大幅转向 ----
+            yaw_stability = 1.5                # yaw 角速度专项惩罚
 
             # ---- 惩罚项 ----
             contact_no_vel = -5.0
@@ -78,13 +101,13 @@ class N2Boxing3Cfg(N2MimicCfg):
             dof_pos_limits = -5.0
             dof_vel_limits = -5.0
 
-        # ---- 拳击动作专用 sigma（更宽松以适应大动作幅度）----
+        # ---- 拳击动作专用 sigma（高精度手臂 + 宽容腿部）----
         class sigma_overrides:
-            tracking_arm_joint_pos = 0.6      # 收紧：手臂关节精度更高
-            tracking_arm_joint_vel = 30.0
-            tracking_arm_max_joint_pos = 1.5  # 收紧
-            tracking_leg_joint_pos = 0.7      # 放松：腿部 sigma 更大（容忍更大偏差）
-            tracking_leg_joint_vel = 20.0
+            tracking_arm_joint_pos = 0.4      # 极紧：手臂精度要求高
+            tracking_arm_joint_vel = 20.0
+            tracking_arm_max_joint_pos = 1.0   # 极紧
+            tracking_leg_joint_pos = 0.8      # 宽容：腿部允许更大偏差
+            tracking_leg_joint_vel = 25.0
 
     # ------------------------------------------------------------------ #
     # domain_rand — 保守设置（拳击平衡敏感）
@@ -131,6 +154,9 @@ class N2Boxing3Cfg(N2MimicCfg):
     class reset:
         root_z_offset = 0.0
         foot_ground_gap = 0.01
+        # 过渡阶段时长（与 rewards.transition 保持一致）
+        stand_stable_duration_s = 0.75
+        startup_duration_s = 2.75
 
 
 class N2Boxing3CfgPPO(N2MimicCfgPPO):
