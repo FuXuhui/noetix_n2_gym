@@ -294,6 +294,8 @@ class N2MimicCfg(LeggedRobotCfg):
             # Boxing3: leg joint tracking (balance support)
             "tracking_leg_joint_pos": 0.5,
             "tracking_leg_joint_vel": 20.0,
+            # Yaw absolute angle tracking
+            "tracking_base_yaw": 0.15,
         }
         
         # 奖励惩罚课程学习配置
@@ -312,7 +314,7 @@ class N2MimicCfg(LeggedRobotCfg):
         reward_penalty_degree = 1.0e-05
         # 需要进行惩罚课程学习的奖励名称
         reward_penalty_reward_names = [
-            "contact_no_vel",
+            # 注意：contact_no_vel 已删除（无对应 reward 函数实现，不生效）
             "feet_contact_forces",
             "dof_acc",
             "energy_cost",

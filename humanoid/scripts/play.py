@@ -295,13 +295,12 @@ def play(args):
             env.gym.write_viewer_image_to_file(env.viewer, filename)
             img_idx += 1
 
-        # 移动相机
+        # 移动相机（MOVE_CAMERA=True 时由脚本驱动相机平移；
+        # FIX_CAMERA 仅在循环开始前 set 一次作为初始视角，
+        # 此后不覆盖 viewer，让 IsaacGym viewer 的鼠标交互生效）
         if MOVE_CAMERA:
             camera_position += camera_vel * env.dt
             env.set_camera(camera_position, camera_position + camera_direction)
-        elif FIX_CAMERA:
-            # 固定相机：每步重新设置一次（覆盖 env.set_camera 的 reset）
-            env.set_camera(fixed_cam_pos, fixed_lookat)
 
         # 奖励记录
         if 0 < i < stop_rew_log:

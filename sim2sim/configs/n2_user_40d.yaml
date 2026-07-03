@@ -1,0 +1,45 @@
+# Config for policy_user.onnx — 40-D SDK format (with phase + euler)
+# Input: [1, 200] = 40 * 5
+# SDK 40-D observation layout (per step):
+#   [ 0: 2]  phase      — [sin(2π·φ), cos(2π·φ)], φ = phase_ / cycle_time
+#   [ 2]     vel_x      — linear_vel_x_cmd * lin_vel_scale  (cmd * 2.0)
+#   [ 3]     vel_y      — linear_vel_y_cmd * lin_vel_scale  (cmd * 2.0)
+#   [ 4]     vel_yaw    — ang_vel_yaw_cmd * ang_vel_obs_scale (cmd * 1.0)
+#   [ 5: 8]  angVel     — base angular velocity * ang_vel_scale (1.0)
+#   [ 8:10]  euler      — base euler X/Y (roll/pitch, from IMU quaternion)
+#   [10:20]  jointError — (q - defaultAngles) * dof_pos_scale
+#   [20:30]  jointVel   — dq * dof_vel_scale (0.05)
+#   [30:40]  prevAction — previous policy output
+
+policy_path: "/home/fff/work/noetix_ddssdk_release/policy/policy_user.onnx"
+xml_path: "{LEGGED_GYM_ROOT_DIR}/resources/robots/N2/mjcf/N2_10dof.xml"
+
+# Marker to tell sim2sim this policy uses SDK 40-D format
+obs_format: "sdk_40d"
+
+simulation_duration: 30.0
+simulation_dt: 0.002
+control_decimation: 5
+cycle_time: 0.64     # matches noetix_sdk_release (phase = phase_/cycle_time)
+
+kps: [80, 80, 120, 120, 20, 80, 80, 120, 120, 20]
+kds: [5, 5, 5, 5, 2, 5, 5, 5, 5, 2]
+
+# SDK default standing pose (from noetix_sdk_release/ning_user.yaml init_state)
+default_angles: [0.0, 0.0, -0.3, 0.6, 0.0,
+                 0.0, 0.0, -0.3, 0.6, -0.3]
+
+ang_vel_scale: 1.0
+dof_pos_scale: 1.0
+dof_vel_scale: 0.05
+action_scale: 0.25
+cmd_scale: [2.0, 2.0, 1.0]      # [lin_vel_x, lin_vel_y, ang_vel_yaw] — also matches SDK obs_scales
+lin_vel_scale: 2.0
+ang_vel_yaw_scale: 1.0
+
+num_actions: 10
+num_single_obs: 40
+frame_stack: 5
+num_obs: 200
+
+cmd_init: [0, 0, 0]

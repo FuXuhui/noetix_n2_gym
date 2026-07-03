@@ -8,7 +8,7 @@ from collections import deque
 from scipy.spatial.transform import Rotation as R
 from humanoid import LEGGED_GYM_ROOT_DIR
 import torch
-from pynput.keyboard import Listener, Key
+from pynput.keyboard import Listener, Key, KeyCode
 import yaml
 import onnxruntime as ort
 
@@ -16,23 +16,45 @@ import matplotlib.pyplot as plt
 
 class cmd:
     def __init__(self):
-        self.cmd = np.array([0., 0., 0.],dtype=np.float32)
-    def cmd_swtich(self, key_input):
-        if key_input == Key.up:
-            self.cmd[0] += 0.1
-        elif key_input == Key.down:
-            self.cmd[0] -= 0.1
-        elif key_input == Key.home:
-            self.cmd[1] += 0.1
-        elif key_input == Key.end:
-            self.cmd[1] -= 0.1
-        elif key_input == Key.insert:
-            self.cmd[2] += 0.1
-        elif key_input == Key.delete:
-            self.cmd[2] -= 0.1
-        elif key_input == Key.f1:
-            self.cmd[:] = 0.
-        print(f"Moved to ({self.cmd[0]}, {self.cmd[1]}, {self.cmd[2]})")
+        self.cmd = np.array([0., 0., 0.], dtype=np.float32)
+        self._keys_pressed = set()
+
+    def on_press(self, key_input):
+        if isinstance(key_input, KeyCode):
+            k = key_input.char
+        else:
+            return  # skip non-char keys in this handler
+        if k == '8':       # Forward
+            self._keys_pressed.add('8')
+        elif k == '2':       # Backward
+            self._keys_pressed.add('2')
+        elif k == '4':       # Turn left
+            self._keys_pressed.add('4')
+        elif k == '6':       # Turn right
+            self._keys_pressed.add('6')
+        elif k == '5':       # Stop all
+            self._keys_pressed.discard('8')
+            self._keys_pressed.discard('2')
+            self._keys_pressed.discard('4')
+            self._keys_pressed.discard('6')
+        self._apply_keys()
+
+    def on_release(self, key_input):
+        if isinstance(key_input, KeyCode):
+            k = key_input.char
+        else:
+            return
+        self._keys_pressed.discard(k)
+        self._apply_keys()
+
+    def _apply_keys(self):
+        forward  = 1.0 if '8' in self._keys_pressed else 0.0
+        backward = 1.0 if '2' in self._keys_pressed else 0.0
+        turn_l   = 1.0 if '4' in self._keys_pressed else 0.0
+        turn_r   = 1.0 if '6' in self._keys_pressed else 0.0
+        self.cmd[0] = forward - backward   # forward/back
+        self.cmd[2] = turn_l - turn_r      # yaw
+        self.cmd[1] = 0.0                 # lateral (not used)
 
 def get_obs(data):
     '''Extracts an observation from the mujoco data structure
@@ -87,6 +109,13 @@ def run_mujoco(cfg):
         num_obs = config["num_obs"]
         num_single_obs = config["num_single_obs"]
         frame_stack = config["frame_stack"]
+
+        # obs_format: "sim2sim_39d" (default) — policy_walk
+        #            "sdk_40d"           — policy_user (with phase + euler)
+        obs_format = config.get("obs_format", "sim2sim_39d")
+        cycle_time = config.get("cycle_time", 1.0)
+        lin_vel_scale = config.get("lin_vel_scale", float(cmd_scale[0]))
+        ang_vel_yaw_scale = config.get("ang_vel_yaw_scale", float(cmd_scale[2]))
     
     model = mujoco.MjModel.from_xml_path(xml_path)
     model.opt.timestep = simulation_dt
@@ -126,6 +155,9 @@ def run_mujoco(cfg):
     count_lowlevel = 0
     L_foot_force_list = []
     R_foot_force_list = []
+    phase_ = 0.0
+
+    print(f"obs_format={obs_format}  cycle_time={cycle_time}  num_single_obs={num_single_obs}  frame_stack={frame_stack}")
 
     for _ in tqdm(range(int(simulation_duration / simulation_dt)), desc="Simulating..."):
 
@@ -134,15 +166,41 @@ def run_mujoco(cfg):
         q = q[-num_actions:]
         dq = dq[-num_actions:]
 
+        # advance phase_ on every control step
+        if count_lowlevel % control_decimation == 0:
+            phase_ += simulation_dt * control_decimation
+
         if count_lowlevel % control_decimation == 0:
             obs = np.zeros([1, num_single_obs], dtype=np.float32)
 
-            obs[0, :3] = command.cmd * cmd_scale
-            obs[0, 3:6] = omega * ang_vel_scale
-            obs[0, 6:9] = gvec[:3]
-            obs[0, 9:9 + num_actions] = (q - defaut_dof_pos) * dof_pos_scale
-            obs[0, 9 + num_actions:9 + num_actions * 2] = dq * dof_vel_scale
-            obs[0, 9 + num_actions * 2:9 + num_actions * 3] = action
+            if obs_format == "sdk_40d":
+                # SDK 40-D format (matches noetix_sdk_release computeObservation)
+                # [0:2]=phase, [2]=vel_x*lin_vel_scale, [3]=vel_y*lin_vel_scale,
+                # [4]=vel_yaw*ang_vel_yaw_scale, [5:8]=omega, [8]=baseEulerX(roll), [9]=baseEulerY(pitch)
+                # [10:20]=jointError, [20:30]=jointVel, [30:40]=prevAction
+                phase = phase_ / cycle_time
+                quat_wxyz = quat                              # mujoco returns [w,x,y,z]
+                quat_xyzw = np.concatenate([quat_wxyz[1:], [quat_wxyz[0]]])
+                euler_xyz = R.from_quat(quat_xyzw).as_euler('xyz', degrees=False)  # [roll, pitch, yaw]
+                obs[0, 0] = np.sin(2 * np.pi * phase)
+                obs[0, 1] = np.cos(2 * np.pi * phase)
+                obs[0, 2] = command.cmd[0] * lin_vel_scale
+                obs[0, 3] = command.cmd[1] * lin_vel_scale
+                obs[0, 4] = command.cmd[2] * ang_vel_yaw_scale
+                obs[0, 5:8] = omega * ang_vel_scale
+                obs[0, 8] = euler_xyz[0]                      # base roll
+                obs[0, 9] = euler_xyz[1]                      # base pitch
+                obs[0, 10:10 + num_actions] = (q - defaut_dof_pos) * dof_pos_scale
+                obs[0, 10 + num_actions:10 + num_actions * 2] = dq * dof_vel_scale
+                obs[0, 10 + num_actions * 2:10 + num_actions * 3] = action
+            else:
+                # sim2sim 39-D format (policy_walk)
+                obs[0, :3] = command.cmd * cmd_scale
+                obs[0, 3:6] = omega * ang_vel_scale
+                obs[0, 6:9] = gvec[:3]
+                obs[0, 9:9 + num_actions] = (q - defaut_dof_pos) * dof_pos_scale
+                obs[0, 9 + num_actions:9 + num_actions * 2] = dq * dof_vel_scale
+                obs[0, 9 + num_actions * 2:9 + num_actions * 3] = action
 
             hist_obs.append(obs)
             hist_obs.popleft()
@@ -162,8 +220,8 @@ def run_mujoco(cfg):
         L_leg_foot_force = data.sensor('L_leg_foot_force')
         R_leg_foot_force = data.sensor('R_leg_foot_force')
 
-        if _ % 10 == 0:
-            print("Current linear velocity x: ", v[0], " Command linear velocity x", command.cmd[0])
+        if _ % 200 == 0:
+            print(f"[{int(_*simulation_dt)}s] vel_x={v[0]:.3f}  cmd_fwd={command.cmd[0]:.2f}  cmd_yaw={command.cmd[2]:.2f}")
 
         L_foot_force_list.append(copy.copy(L_leg_foot_force.data[2]))
         R_foot_force_list.append(copy.copy(R_leg_foot_force.data[2]))
@@ -218,6 +276,6 @@ if __name__ == '__main__':
     command = cmd()
     if "cmd_init" in config:
         command.cmd = np.array(config["cmd_init"], dtype=np.float32)
-    listener = Listener(on_press=command.cmd_swtich)
+    listener = Listener(on_press=command.on_press, on_release=command.on_release)
     listener.start()
     run_mujoco(config_file)

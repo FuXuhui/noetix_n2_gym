@@ -116,6 +116,8 @@ class N2MimicEnv(N2Env):
         )
         self.motion_lenth = self.motion_loader.trajectory_lens[0]
         self.motion_start_times = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device, requires_grad=False)
+        # Episode 初始 yaw（用于累积漂移惩罚）：reset 时记录
+        self.episode_initial_yaw = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device, requires_grad=False)
 
         # 合并 sigma_overrides 到 reward_tracking_sigma
         if hasattr(self.cfg.rewards, 'sigma_overrides'):
@@ -195,6 +197,10 @@ class N2MimicEnv(N2Env):
         ref_ang_vel = self.motion_loader_class.get_angular_vel_batch(frames)
         self.ref_ang_vel = quat_rotate_inverse(self.base_quat, ref_ang_vel)
 
+        # 获取参考 root rotation（用于 yaw 绝对角度跟踪）
+        self.ref_root_rot = self.motion_loader_class.get_root_rot_batch(frames)
+        self.ref_yaw = get_euler_xyz_tensor(self.ref_root_rot)[:, 2]
+
         # 获取参考关节位置、速度和关键点位置
         self.ref_dof_pos = self.motion_loader_class.get_joint_pose_batch(frames)
         self.ref_dof_vel = self.motion_loader_class.get_joint_vel_batch(frames)
@@ -226,6 +232,8 @@ class N2MimicEnv(N2Env):
             self.ref_dof_vel[stand_mask] = 0.0
             self.ref_lin_vel[stand_mask] = 0.0
             self.ref_ang_vel[stand_mask] = 0.0
+            # 默认姿态朝向 yaw=0
+            self.ref_yaw[stand_mask] = 0.0
 
         # 启动阶段：平滑混合 default → motion（参考随时间推进，不再锁定 frame_0）
         # blend 控制 default → motion 的混合比，motion_ref_time 让参考随 startup 推进 motion
@@ -258,6 +266,11 @@ class N2MimicEnv(N2Env):
                 self.ref_contact_mask[startup_mask] = motion_contact
                 self.ref_lin_vel[startup_mask] = 0.0
                 self.ref_ang_vel[startup_mask] = 0.0
+                # yaw 参考：从默认朝向向 motion 朝向混合
+                motion_root_orn = self.motion_loader_class.get_root_rot_batch(frames_motion)
+                motion_yaw = get_euler_xyz_tensor(motion_root_orn)[:, 2]
+                default_yaw = torch.zeros(n_startup, device=self.device)
+                self.ref_yaw[startup_mask] = default_yaw * (1 - blend) + motion_yaw * blend
 
     def post_physics_step(self):
         """ 检查终止条件，计算观测值和奖励
@@ -580,6 +593,8 @@ class N2MimicEnv(N2Env):
             if switch_to_startup.any():
                 self.transition_phase_buf[switch_to_startup] = 1
                 self.transition_timer_buf[switch_to_startup] = 0.0
+                # 记录 episode 初始 yaw（此时 base_quat 仍为 reset 朝向，是真正的起点）
+                self.episode_initial_yaw[switch_to_startup] = get_euler_xyz_tensor(self.base_quat[switch_to_startup])[:, 2]
 
         startup_mask = (self.transition_phase_buf == 1)
         if startup_mask.any():
@@ -902,13 +917,30 @@ class N2MimicEnv(N2Env):
         return rew
 
     def _reward_tracking_feet_pos(self):
-        """足部位置跟踪奖励"""
+        """足部位置跟踪奖励（已修复：正确指向参考 motion 的脚部 body）。
+
+        修复：
+        - 旧实现：用 URDF foot_name="ankle" 找踝关节 index → clamp 到 [0,19]
+          → L_leg_ankle(URDF body[15]) clamp→15 → 但 ref_key_pos[15] 是躯干，完全错误
+        - 新实现：参考脚部在 ref_key_pos 中 index=[4, 13]（z 最低的两个 body，y 符号相反确认左右脚）
+
+        ref_key_pos: (num_envs, 20, 3) — 20 个 MuJoCo body 的 root-relative 位置
+        body[4] = 左脚 (y=+0.167, z=-0.216)
+        body[13] = 右脚 (y=-0.198, z=-0.168)
+        """
         ref_key_pos = self.ref_key_pos.reshape(self.num_envs, -1, 3)
         num_ref = ref_key_pos.shape[1]
 
-        feet = torch.clamp(self.feet_indices, 0, num_ref - 1)
+        foot_ref_idxs = torch.tensor([4, 13], dtype=torch.long, device=self.device)
+        foot_ref_idxs = torch.clamp(foot_ref_idxs, 0, num_ref - 1)
 
-        feet_diff = ref_key_pos[:, feet, :] - self.key_pos_trunc[:, feet, :]
+        # 直接从 rigid_body_states_view 取 feet（21-body，未截断），避免 URDF→ref 索引映射错误
+        feet_pos_robot = self.rigid_body_states_view[:, self.feet_indices, :3]
+        root_pos = self.root_states[:, :3].unsqueeze(1)
+        feet_pos_robot_local = feet_pos_robot - root_pos
+
+        feet_pos_ref = ref_key_pos[:, foot_ref_idxs, :]
+        feet_diff = feet_pos_ref - feet_pos_robot_local
         feet_dist = (feet_diff**2).mean(dim=-1).mean(dim=-1)
         rew = torch.exp(-feet_dist / self.cfg.rewards.reward_tracking_sigma["tracking_feet_pos"])
 
@@ -931,6 +963,18 @@ class N2MimicEnv(N2Env):
         diff = ((body_ang_vel - body_ang_vel_target) ** 2).mean(dim=-1)
         rew = torch.exp(-diff / self.cfg.rewards.reward_tracking_sigma["tracking_body_ang_vel"]) 
         self._update_adaptive_sigma(diff, 'tracking_body_ang_vel')
+        return rew
+    
+    def _reward_tracking_base_yaw(self):
+        """Base yaw 绝对角度跟踪奖励：约束机器人朝向不漂移。
+
+        拳击动作朝向固定（只有小幅扭腰），reward_tracking_sigma 中的 tracking_base_yaw
+        控制精度。standalone 阶段 motion yaw 几乎为 0，startup 阶段向 motion 方向混合。
+        """
+        base_yaw = get_euler_xyz_tensor(self.base_quat)[:, 2]
+        diff = (base_yaw - self.ref_yaw).abs()
+        rew = torch.exp(-diff / self.cfg.rewards.reward_tracking_sigma["tracking_base_yaw"])
+        self._update_adaptive_sigma(diff, 'tracking_base_yaw')
         return rew
     
     def _reward_tracking_joint_pos(self):
@@ -1027,16 +1071,58 @@ class N2MimicEnv(N2Env):
         return rew
 
     def _reward_tracking_leg_joint_vel(self):
-        """腿部关节速度跟踪奖励（仅腿部 DOFs）
+        """腿部关节速度跟踪奖励（仅腿部 DOFs）—— 消除「站」的奖励。
 
-        保证站立和移动时的平衡感。
+        核心修改：消除对"静止"的奖励。原有实现 reward = exp(-|v-v_ref|²/sigma) 在 ref_vel=0
+        时奖励"站着不动"（v=0 最佳），与 motion_incentive 冲突。
+
+        新策略：
+        - ref_vel ≈ 0（stand/startup）：惩罚腿部速度幅度，避免高频小幅抖动刷 motion_incentive
+        - ref_vel ≠ 0（motion）：鼓励方向对齐，同时惩罚幅度偏差
         """
         leg_idx = self.leg_dof_idxs
         cur = self.dof_vel[:, leg_idx]
         ref = self.ref_dof_vel[:, leg_idx]
-        diff = ((cur - ref) ** 2).mean(dim=-1)
-        rew = torch.exp(-diff / self.cfg.rewards.reward_tracking_sigma["tracking_leg_joint_vel"])
-        self._update_adaptive_sigma(diff, 'tracking_leg_joint_vel')
+
+        ref_mag = torch.norm(ref, dim=1)
+        cur_mag = torch.norm(cur, dim=1)
+
+        # threshold = 0.3 rad/s，区分"静止参考"和"运动参考"
+        is_quiet_ref = ref_mag < 0.3
+
+        rew = torch.zeros_like(ref_mag)
+
+        # Case 1: ref 几乎静止（stand/startup phase）
+        # 惩罚腿部关节速度幅度，reward = exp(-|cur| / 3.0)
+        #   cur=0 → exp(0)=1.0（全奖励）；cur=2 → exp(-0.67)=0.51
+        #   与旧版"v=0 时最高奖励"相反：现在站着才能拿高分
+        rew_quiet = torch.exp(-cur_mag / 3.0)
+        rew = rew_quiet
+
+        # Case 2: ref 有速度（motion phase）
+        # 方向对齐奖励：v_cur 与 v_ref 同向则加分，反向则严惩
+        # cos_sim = dot(v_cur, v_ref) / (|v_cur||v_ref|)
+        cos_sim = torch.sum(cur * ref, dim=1) / (cur_mag * ref_mag + 1e-6)
+        # cos_sim ∈ [-1, 1]: 同向→1, 垂直→0, 反向→-1
+        # 惩罚反向（cos<0），轻微奖励同向
+        dir_rew = 0.5 + 0.5 * cos_sim  # ∈ [0, 1]
+
+        # 幅度惩罚：避免超过 ref 太多
+        mag_ratio = cur_mag / (ref_mag + 1e-6)
+        # ratio > 1.5 → 开始惩罚，ratio=2 → 0.5
+        mag_rew = torch.clamp(2.0 - torch.abs(mag_ratio - 1.0), 0.0, 2.0) * 0.5
+
+        rew_motion = dir_rew * mag_rew  # ∈ [0, 1]
+
+        # 平滑过渡：quiet ref → motion ref 时逐渐切换
+        # 用 ref_mag 在 [0.2, 0.4] 范围做线性混合
+        alpha = torch.clamp((ref_mag - 0.2) / 0.2, 0.0, 1.0)
+        rew = rew_quiet * (1 - alpha) + rew_motion * alpha
+
+        # 注意：adaptive sigma 已关闭（enable_adaptive_tracking_sigma=False）
+        # 此处传入误差值不影响实际 sigma，但保持与其他 reward 的一致性
+        error_for_sigma = ((cur - ref) ** 2).mean(dim=-1)
+        self._update_adaptive_sigma(error_for_sigma, 'tracking_leg_joint_vel')
         return rew
 
     def _reward_tracking_contact_mask(self):
@@ -1067,11 +1153,20 @@ class N2MimicEnv(N2Env):
 
         在 stand/startup 阶段 ref_vel=0 时，tracking 奖励不起作用。
         该奖励对非零关节速度给予正奖励，推动机器人主动跟随 motion。
+        拳击动作需要手臂和腿部都主动运动，因此同时鼓励两者。
+
+        重要：饱和上限大幅收紧（3.0 vs 旧的 10.0），防止 policy 通过高频小幅抖动刷奖励。
+        机器人必须真正学会"近似 ref 方向的大幅运动"才能拿到 tracking 奖励，
+        而 motion_incentive 仅作为避免完全静止的"地板奖励"。
         """
-        # 使用手臂关节速度为主（拳击核心在手臂动作）
         arm_vel = self.dof_vel[:, self.arm_dof_idxs]
+        leg_vel = self.dof_vel[:, self.leg_dof_idxs]
         arm_vel_mag = torch.norm(arm_vel, dim=1)
-        rew = torch.clamp(arm_vel_mag - 0.2, 0.0, 10.0) * 0.5
+        leg_vel_mag = torch.norm(leg_vel, dim=1)
+        # 饱和上限从 10.0 收紧到 3.0 —— 即使狂抖也只能拿 0.75（×0.25）
+        arm_rew = torch.clamp(arm_vel_mag - 0.2, 0.0, 3.0)
+        leg_rew = torch.clamp(leg_vel_mag - 0.2, 0.0, 3.0)
+        rew = (arm_rew + leg_rew) * 0.25
         return rew
 
     def _reward_base_tilt_asymmetric(self):
@@ -1104,3 +1199,27 @@ class N2MimicEnv(N2Env):
         ref_yaw_vel = self.ref_ang_vel[:, 2]
         error = torch.clamp((yaw_vel - ref_yaw_vel).abs() - 0.2, 0.0, 10.0) ** 2
         return -1.0 * error
+
+    def _reward_yaw_drift_penalty(self):
+        """累积 yaw 漂移惩罚：限制 episode 期间的整体朝向漂移。
+
+        目标：防止机器人通过缓慢累积旋转（绕开角速度惩罚）实现大幅整体转向。
+        - 不拦截快速扭胯（瞬时大幅旋转，但累积漂移小）
+        - 只惩罚持续累积的朝向改变
+        - motion phase (phase==2) 才生效，stand/startup 阶段用 ref_yaw 跟踪
+        """
+        phase2_mask = (self.transition_phase_buf == 2)
+
+        # 当前 yaw 与 episode 初始 yaw 的差
+        current_yaw = get_euler_xyz_tensor(self.base_quat)[:, 2]
+        yaw_delta = current_yaw - self.episode_initial_yaw
+        # wrap 到 [-pi, pi]
+        yaw_delta = (yaw_delta + torch.pi) % (2 * torch.pi) - torch.pi
+
+        # 仅在 motion 阶段惩罚；用 abs() 双边惩罚（正向/负向漂移都惩罚）
+        drift = yaw_delta.abs() - 0.26   # 容忍 0.26 rad ≈ 15°
+        penalty = torch.clamp(drift, 0.0, 10.0) ** 2
+
+        # startup 阶段：如果 episode_initial_yaw 未被记录（phase 一直为 0/1），不惩罚
+        penalty = penalty * phase2_mask.float()
+        return -1.5 * penalty
